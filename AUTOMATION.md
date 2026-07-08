@@ -59,7 +59,9 @@ set is also archived to `data/questions-archive/YYYY-MM-DD.json` for audit
 ## Changing the model or schedule
 
 - Model: set `GROQ_MODEL` or `GEMINI_MODEL` as an extra repo secret/variable
-  to override the defaults (`llama-3.3-70b-versatile` / `gemini-2.0-flash`).
+  to override the defaults (`llama-3.3-70b-versatile` / `gemini-2.5-flash`).
+  Note: as of mid-2026, `gemini-2.0-flash`/`gemini-2.0-flash-lite` have no free-tier
+  quota left on new keys (`limit: 0`) — stick to `gemini-2.5-*` models.
 - Schedule: edit the `cron` line in `.github/workflows/daily-questions.yml`.
 - Topics: edit `ALLOWED_TOPICS` in `scripts/generate-questions.mjs` — the
   start-screen topic chips are regenerated automatically to match whatever

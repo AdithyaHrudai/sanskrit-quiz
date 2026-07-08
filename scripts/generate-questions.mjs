@@ -108,7 +108,7 @@ async function callGroq(prompt) {
 }
 
 async function callGemini(prompt) {
-  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90_000);
   try {
