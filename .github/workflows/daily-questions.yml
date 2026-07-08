@@ -1,0 +1,44 @@
+name: Daily question refresh
+
+on:
+  schedule:
+    # 02:30 UTC = 08:00 IST, daily
+    - cron: '30 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-questions
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate new question bank
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node scripts/generate-questions.mjs
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "sanskrit-quiz-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add index.html data/questions-archive data/last-run.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Daily question refresh: $(date -u +%Y-%m-%d)"
+            git push
+          fi
