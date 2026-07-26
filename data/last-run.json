@@ -1,18 +1,18 @@
 {
-  "date": "2026-07-25",
+  "date": "2026-07-26",
   "provider": "gemini",
   "status": "OK",
   "total": 100,
   "topicCounts": {
     "vy": 12,
     "pu": 12,
-    "de": 12,
+    "de": 10,
     "gk": 12,
-    "rc": 12,
-    "sh": 12,
-    "wg": 7,
-    "it": 7,
-    "su": 7,
-    "sa": 7
+    "wg": 10,
+    "rc": 10,
+    "it": 10,
+    "su": 8,
+    "sh": 8,
+    "sa": 8
   }
 }
