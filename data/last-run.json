@@ -1,17 +1,17 @@
 {
-  "date": "2026-10-19",
+  "date": "2026-10-20",
   "provider": "gemini",
   "status": "OK",
   "total": 100,
   "topicCounts": {
-    "vy": 10,
-    "pu": 10,
+    "vy": 20,
+    "pu": 14,
     "de": 10,
-    "gk": 10,
-    "wg": 10,
-    "rc": 10,
+    "gk": 7,
+    "wg": 6,
+    "rc": 6,
     "it": 10,
-    "su": 10,
+    "su": 7,
     "sh": 10,
     "sa": 10
   }
