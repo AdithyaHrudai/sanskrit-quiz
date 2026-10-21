@@ -62,13 +62,18 @@ export const BATCHES = [
 ];
 export const TOTAL = BATCHES.reduce((s, b) => s + b.n, 0);
 
-const ROUNDS_PER_BATCH = 4;        // top-up calls per batch before giving up
+const ROUNDS_PER_BATCH = 6;        // top-up calls per batch before giving up
 const EXTRA_PER_CALL = 3;          // ask for a few spare questions to absorb drops
 const TRIES_PER_PROVIDER = 3;      // per call, on transient errors, before falling back
 const BACKOFF_MS = [20_000, 60_000];
 const CALL_TIMEOUT_MS = 180_000;
 const BUDGET_MS = 30 * 60_000;     // stays well inside the workflow's 45-minute job timeout
 const ARCHIVE_KEEP = 30;
+// Questions from the newest RECENT_SETS sets are never repeated, and the ones
+// matching a batch are shown to the model so it doesn't propose them. Easy
+// questions draw on a small pool of famous facts, so a longer window starves
+// the easy batches (seen live: most candidates were exact repeats).
+const RECENT_SETS = 10;
 
 const DEVANAGARI_RE = /[ऀ-ॿ]/;
 const LATIN_RE = /[A-Za-z]/;
@@ -340,7 +345,7 @@ async function reviewQuestions(questions, ctx) {
 async function fillBatch(batch, ctx) {
   const got = [];
   const used = new Set();
-  const prior = ctx.previous.filter(q => q.d === batch.d && batch.topics.includes(q.t)).map(q => q.q);
+  const prior = ctx.recent.filter(q => q.d === batch.d && batch.topics.includes(q.t)).map(q => q.q);
 
   for (let round = 1; round <= ROUNDS_PER_BATCH && got.length < batch.n; round++) {
     const need = batch.n - got.length;
@@ -352,7 +357,7 @@ async function fillBatch(batch, ctx) {
     const { questions, errors } = parseBatch(text, batch, ctx.seen, ask);
     const { keep, flagged } = await reviewQuestions(questions, ctx);
     got.push(...keep.slice(0, need));
-    const notes = [errors.length && `dropped ${errors.length} invalid (${errors.slice(0, 3).join('; ')})`, flagged && `review flagged ${flagged}`]
+    const notes = [errors.length && `dropped ${errors.length} (${errors.slice(0, 3).join('; ')})`, flagged && `review flagged ${flagged}`]
       .filter(Boolean).join(', ');
     ctx.log(`  round ${round} via ${provider}: +${Math.min(keep.length, need)} (${got.length}/${batch.n})${notes ? ` — ${notes}` : ''}`);
   }
@@ -468,11 +473,10 @@ export async function main({
 
   if (!providers.length) throw new GenerationError('No API key configured — set GEMINI_API_KEY or GROQ_API_KEY as a repo secret.', false);
 
-  const archive = readArchive(archiveDir);
-  const seen = new Set(archive.flatMap(s => s.questions.map(q => normalize(q.q))));
-  const previous = archive.find(s => s.date === setId)?.questions ?? archive.at(-1)?.questions ?? [];
+  const recent = readArchive(archiveDir).slice(-RECENT_SETS).flatMap(s => s.questions);
+  const seen = new Set(recent.map(q => normalize(q.q)));
 
-  const ctx = { providers, seen, previous, log, backoffMs, deadline: Date.now() + budgetMs };
+  const ctx = { providers, seen, recent, log, backoffMs, deadline: Date.now() + budgetMs };
   const questions = [];
   const usedProviders = new Set();
   for (const [i, batch] of BATCHES.entries()) {

@@ -23,7 +23,8 @@ nothing runs against the LLM API or the repo.
    - otherwise generates a new set in six small batches (easy / medium / hard ×
      two topic groups, 10 questions per topic), so each API call is quick;
    - drops individual invalid questions (wrong topic, non-Devanagari or Latin
-     text, not 4 distinct options, duplicates of the last 30 sets) and asks
+     text, not 4 distinct options, repeats from the last 10 sets — which are
+     also listed in the prompt so the model avoids them) and asks
      for replacements, rather than throwing away the whole set;
    - sends every batch to a second, temperature-0 "strict reviewer" call that
      flags wrong or ambiguous questions, which are also replaced;
@@ -95,7 +96,7 @@ curl https://abacus.jasoncameron.dev/get/adithyahrudai-sanskrit-quiz/set-2026-10
 
 (404 means nobody yet.) `data/last-run.json` records the latest refresh, and
 each set is archived to `data/questions-archive/YYYY-MM-DD.json` (newest 30
-kept; also used to avoid repeating questions).
+kept; the newest 10 are used to avoid repeating questions).
 
 Offline tests: `node scripts/test-dryrun.mjs`.
 

@@ -61,8 +61,10 @@ function mockProvider(name, { failWith } = {}) {
   return {
     name,
     calls: 0,
+    prompts: [],
     async call(prompt) {
       this.calls++;
+      this.prompts.push(prompt);
       if (failWith) throw failWith;
       if (prompt.includes('strict Sanskrit scholar')) return JSON.stringify({ bad: reviews++ < 3 ? [0] : [] });
       const n = Number(prompt.match(/Write exactly (\d+) multiple-choice/)[1]);
@@ -138,6 +140,11 @@ console.log('main() skip paths: OK');
   const r = await main(opts({ root: dir, providers: [overloaded, badKey, ok], fetchFn: counter(2) }));
   assert.equal(r.status, 'refreshed', r.reason);
   assert.equal(badKey.calls, 1, 'a permanently failing provider is tried once, then skipped');
+  // easy group-A prompt lists recent archived easy "vy" questions (last 10 sets only)
+  const easyA = ok.prompts.find(p => p.includes('Difficulty of every question: easy') && p.includes('"vy"'));
+  assert.ok(easyA.includes('पुरातनः ३१ ?') && easyA.includes('पुरातनः २२ ?'), 'recent sets go in the avoid list');
+  assert.ok(!easyA.includes('पुरातनः २१ ?'), 'older sets are not');
+  assert.ok(!ok.prompts.find(p => p.includes('Difficulty of every question: hard')).includes('पुरातनः'), 'avoid list is per difficulty');
 
   const html = readFileSync(path.join(dir, 'index.html'), 'utf8');
   assert.equal(readSetId(html), '2026-10-22');
