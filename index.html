@@ -572,11 +572,8 @@ function showNote(el) {
 let order = [], idx = 0, score = 0, locked = false, timer = null;
 
 function buildOrder() {
-  // fully jumbled — all topics and difficulties randomly mixed, but questions
-  // not yet answered on this device come first so replays move towards NEED
-  const fresh = BANK.filter((q, i) => !answered.has(i));
-  const seen = BANK.filter((q, i) => answered.has(i));
-  order = shuffle(fresh).concat(shuffle(seen));
+  // fully jumbled on every start — all topics and difficulties randomly mixed
+  order = shuffle(BANK);
 }
 
 /* ---------- screens ---------- */

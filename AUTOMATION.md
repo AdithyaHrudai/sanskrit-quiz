@@ -9,8 +9,8 @@ nothing runs against the LLM API or the repo.
 
 1. **The page** (`index.html`) remembers which questions this device has
    answered for the current set (`SET_ID`), in `localStorage`, so a reload
-   doesn't lose progress — and unanswered questions are served first on a
-   replay. When the count reaches half the set, it pings a free public
+   doesn't lose progress. The question order is reshuffled every time the quiz
+   is started. When the count reaches half the set, it pings a free public
    counter once:
    `https://abacus.jasoncameron.dev/hit/adithyahrudai-sanskrit-quiz/set-<SET_ID>`
    ([Abacus](https://jasoncameron.dev/abacus/) — no account or key needed).
@@ -31,7 +31,8 @@ nothing runs against the LLM API or the repo.
    - only rewrites `index.html` once all 100 are in hand, then commits.
 
    The 12:00 and 16:00 runs are retries: once the morning run has refreshed,
-   they see "already today's set" and exit in seconds.
+   they see "already today's set" and exit in seconds. (GitHub often starts
+   scheduled runs hours late — that's fine, nothing depends on the exact time.)
 
 3. **Providers**: Gemini (`gemini-2.5-flash`), falling back to
    `gemini-2.5-flash-lite` (separate free quota) when the first is overloaded,
@@ -40,17 +41,19 @@ nothing runs against the LLM API or the repo.
 
 ## When will I get a failure email?
 
-Only when something is actually broken:
+GitHub only emails when a run is marked failed, so that is reserved for
+problems that need you (`shouldFail()` in `scripts/generate-questions.mjs`):
 
-- **Transient problems** (API overloaded, timeouts, counter unreachable) on the
-  08:00 or 12:00 run only log a warning — the next run retries. If the 16:00
-  run still can't refresh, that run fails and you get an email. The set is
-  still pending, so the next day's 08:00 run tries again.
-- **Permanent problems** (no/invalid API key, `index.html` markers missing)
-  fail on any run.
-- Manual runs always report failures.
-
-If a run fails, the live quiz keeps serving the last good set.
+- **Ordinary flakiness** (API overloaded, rate-limited, timeouts, counter
+  temporarily unreachable) only logs a warning and the run stays green. The
+  next scheduled run — or tomorrow's — retries on its own, and the live quiz
+  keeps serving the current set meanwhile.
+- **A refresh that stays undone for 3 mornings** (played set is 3+ days old) is
+  reported as failed by the 16:00 run, so a quietly dead pipeline can't go
+  unnoticed.
+- **Real breakage** fails immediately: no/invalid API key or model, markers
+  missing from `index.html`, unexpected code errors, a failed push.
+- **Manual runs** always report failures.
 
 ## Inactivity keepalive
 

@@ -1,0 +1,46 @@
+name: Refresh end-to-end test (temporary)
+# Same steps as daily-questions.yml, but the generator step can never mark the
+# job failed (so a test can't send a failure email). Removed after use.
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: daily-questions
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Refresh question bank if the current set was played
+        id: gen
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          GEMINI_FALLBACK_MODEL: ${{ secrets.GEMINI_FALLBACK_MODEL }}
+          FINAL_ATTEMPT: 'true'
+        run: node scripts/generate-questions.mjs
+      - name: Report
+        run: echo "generator outcome: ${{ steps.gen.outcome }}"
+      - name: Commit and push if changed
+        run: |
+          git config user.name "sanskrit-quiz-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add index.html data/questions-archive data/last-run.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Question refresh: $(TZ=Asia/Kolkata date +%Y-%m-%d)"
+            for attempt in 1 2 3; do
+              git pull --rebase -q origin main && git push -q origin HEAD:main && exit 0
+              sleep 5
+            done
+            exit 1
+          fi

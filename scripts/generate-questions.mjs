@@ -179,7 +179,7 @@ async function postJson(url, headers, body) {
   if (res.status === 429) throw rateLimitError(text, res.headers.get('retry-after'));
   if (!res.ok) {
     // 5xx is worth retrying; anything else (bad key, unknown model) won't fix itself.
-    throw new GenerationError(`HTTP ${res.status}: ${text.slice(0, 300)}`, res.status >= 500);
+    throw new GenerationError(`HTTP ${res.status}: ${text.replace(/\s+/g, ' ').slice(0, 300)}`, res.status >= 500);
   }
   try {
     return JSON.parse(text);
@@ -557,23 +557,50 @@ function summary(line) {
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
 }
 
+/* ---------- failure reporting ---------- */
+
+// A failed run is the only thing that makes GitHub send an email, so it is
+// reserved for problems that need a human:
+//   - anything that isn't a plain API hiccup (bad key, broken markers, a bug);
+//   - a manual run (someone is watching);
+//   - a refresh that has stayed undone for STALE_DAYS mornings, and only from
+//     the last slot of the day.
+// Ordinary flakiness (overloaded API, rate limits, timeouts) just logs a
+// warning: the next slot — or tomorrow's — retries on its own, and the live
+// quiz keeps serving the current set meanwhile.
+export const STALE_DAYS = 3;
+
+export function daysBetween(fromDate, toDate) {
+  return Math.round((Date.parse(`${toDate}T00:00:00Z`) - Date.parse(`${fromDate}T00:00:00Z`)) / 86_400_000);
+}
+
+export function shouldFail(err, { manual, final, setId, today }) {
+  const transient = err instanceof GenerationError && err.transient === true;
+  if (!transient || manual) return true;
+  return final && setId != null && daysBetween(setId, today) >= STALE_DAYS;
+}
+
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
-  // Transient failures (API overloaded, timeouts, counter unreachable) are
-  // retried by the next scheduled slot the same day, so only the last slot —
-  // or a manual run — reports them as a failed run.
-  const final = process.env.FINAL_ATTEMPT !== 'false';
   main()
     .then(({ status, reason }) => {
       console.log(`::notice::${status === 'skipped' ? 'Skipped' : 'Refreshed'} — ${reason}`);
       summary(`**${status}** — ${reason}`);
     })
     .catch(e => {
-      const transient = e.transient !== false;
       console.error(e.stack || e.message);
       summary(`**failed** — ${e.message}`);
-      if (transient && !final) {
-        console.log(`::warning::Refresh failed (${e.message}) — a later slot today will retry.`);
+      let setId = null;
+      try { setId = readSetId(readFileSync(path.join(DEFAULT_ROOT, 'index.html'), 'utf8')); } catch { /* reported as a hard failure below */ }
+      const today = istDate();
+      const fail = shouldFail(e, {
+        manual: process.env.GITHUB_EVENT_NAME === 'workflow_dispatch',
+        final: process.env.FINAL_ATTEMPT === 'true',
+        setId,
+        today,
+      });
+      if (!fail) {
+        console.log(`::warning::Refresh failed (${e.message}) — will retry at the next scheduled run.`);
         return;
       }
       console.log(`::error::Refresh failed: ${e.message}`);

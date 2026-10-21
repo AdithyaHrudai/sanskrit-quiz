@@ -2,7 +2,10 @@ name: Daily question refresh
 
 # Refreshes the question set at most once per day, and only if someone
 # answered at least half of the current set (see AUTOMATION.md). On days
-# nobody played, every run exits quietly without touching the repo.
+# nobody played, every run exits quietly without touching the repo. API
+# flakiness only logs a warning (a later run retries); a run is marked failed
+# — and GitHub sends its email — only for real breakage (see shouldFail() in
+# scripts/generate-questions.mjs).
 on:
   schedule:
     - cron: '30 2 * * *'    # 08:00 IST — main slot
@@ -66,5 +69,11 @@ jobs:
             echo "No changes to commit."
           else
             git commit -m "Question refresh: $(TZ=Asia/Kolkata date +%Y-%m-%d)"
-            git push
+            # rebase first so a commit pushed to main while we were generating can't fail the push
+            for attempt in 1 2 3; do
+              git pull --rebase -q origin main && git push -q origin HEAD:main && exit 0
+              sleep 5
+            done
+            echo "::error::Could not push the refreshed question set"
+            exit 1
           fi

@@ -6,7 +6,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import {
   BATCHES, TOTAL, COUNTER_NS, GenerationError, istDate, readSetId, stripFences,
-  checkQuestion, parseBatch, buildPrompt, buildReviewPrompt, rateLimitError, main,
+  checkQuestion, parseBatch, buildPrompt, buildReviewPrompt, rateLimitError, daysBetween, shouldFail, main,
 } from './generate-questions.mjs';
 
 const ROOT = new URL('..', import.meta.url);
@@ -21,6 +21,23 @@ assert.ok(realHtml.includes(`const COUNTER_NS = '${COUNTER_NS}';`), 'index.html 
 assert.equal(TOTAL, 100);
 assert.deepEqual([0, 1, 2].map(d => BATCHES.filter(b => b.d === d).reduce((s, b) => s + b.n, 0)), [30, 40, 30]);
 console.log('helpers: OK');
+
+// --- failure reporting: when is a failed (= emailed) run warranted? ---
+{
+  const hiccup = new GenerationError('HTTP 503', true);
+  const hard = new GenerationError('bad key', false);
+  const base = { manual: false, final: true, setId: '2026-10-20', today: '2026-10-21' };
+  assert.equal(daysBetween('2026-10-30', '2026-11-02'), 3, 'month boundary');
+  assert.equal(shouldFail(hiccup, base), false, 'API hiccup, set only 1 day old: warn only');
+  assert.equal(shouldFail(hiccup, { ...base, today: '2026-10-22' }), false, '2 days: still warn only');
+  assert.equal(shouldFail(hiccup, { ...base, today: '2026-10-23' }), true, '3 mornings stale on the last slot: report');
+  assert.equal(shouldFail(hiccup, { ...base, today: '2026-10-25', final: false }), false, 'never from a non-final slot');
+  assert.equal(shouldFail(hard, { ...base, final: false }), true, 'permanent errors always report');
+  assert.equal(shouldFail(new TypeError('bug'), base), true, 'unexpected exceptions always report');
+  assert.equal(shouldFail(hiccup, { ...base, manual: true }), true, 'manual runs always report');
+  assert.equal(shouldFail(hiccup, { ...base, setId: null, today: '2026-10-25' }), false, 'unknown set id never counts as stale');
+}
+console.log('shouldFail(): OK');
 
 // --- per-question validation ---
 const good = { t: 'vy', q: 'रामस्य पिता कः ?', a: ['दशरथः', 'जनकः', 'वसिष्ठः', 'विश्वामित्रः'] };
