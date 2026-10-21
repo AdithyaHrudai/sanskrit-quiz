@@ -7,11 +7,12 @@
 // visitor has answered at least half of the current set. If nobody has, this
 // script exits quietly without calling any LLM or touching the repo.
 //
-// When a refresh is due, 100 questions are generated in six small batches
-// (one per difficulty × topic group) so each call is fast. Each batch is then
-// fact-checked by a second, temperature-0 review call; invalid or flagged
-// questions are dropped and topped up instead of failing the whole set.
-// index.html is only rewritten once all 100 are in hand, so the live quiz
+// When a refresh is due, the set is built with as few API calls as possible,
+// because the Gemini free tier caps requests per day: one generation call per
+// difficulty (each covering every topic, with one spare question per topic) and
+// one review call that fact-checks everything at once. Flagged or invalid
+// questions are replaced from the spares, so ~4 calls normally suffice.
+// index.html is only rewritten once the set is complete, so the live quiz
 // always keeps serving the last known-good set.
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, appendFileSync } from 'node:fs';
@@ -52,18 +53,15 @@ const DIFFICULTY = [
   'hard — for serious students and scholars; precise, lesser-known but well-established facts',
 ];
 
-// Two topic groups × three difficulties = six batches, 10 questions per topic.
-const GROUP_A = ['vy', 'pu', 'de', 'gk', 'wg'];
-const GROUP_B = ['rc', 'it', 'su', 'sh', 'sa'];
-export const BATCHES = [
-  { d: 0, n: 15, topics: GROUP_A }, { d: 0, n: 15, topics: GROUP_B },
-  { d: 1, n: 20, topics: GROUP_A }, { d: 1, n: 20, topics: GROUP_B },
-  { d: 2, n: 15, topics: GROUP_A }, { d: 2, n: 15, topics: GROUP_B },
-];
-export const TOTAL = BATCHES.reduce((s, b) => s + b.n, 0);
+// Questions per difficulty. Split evenly over all topics (3/4/3 each → 10 per topic).
+const DIFFICULTY_COUNTS = [30, 40, 30];
+export const TOTAL = DIFFICULTY_COUNTS.reduce((a, b) => a + b, 0);
+const MIN_TOTAL = 90;              // publish a slightly short set rather than none
+const TOPIC_KEYS = Object.keys(ALLOWED_TOPICS);
+const GEN_ROUNDS = 3;              // generation calls per difficulty; normally 1 is enough
 
-const ROUNDS_PER_BATCH = 6;        // top-up calls per batch before giving up
-const EXTRA_PER_CALL = 3;          // ask for a few spare questions to absorb drops
+// Gemini's free tier caps requests per DAY per model (and per minute), so a
+// refresh is built to need only ~4 calls: 3 generation + 1 review.
 const TRIES_PER_PROVIDER = 3;      // per call, on 5xx/timeouts, before falling back
 const BACKOFF_MS = [20_000, 60_000];
 // Free-tier quotas are per minute per model, and a refresh makes ~15 calls
@@ -188,6 +186,10 @@ async function postJson(url, headers, body) {
   }
 }
 
+// Gemini 3+ models are meant to run at their default temperature (lower values
+// can degrade their reasoning), so the setting is only sent to older models.
+const takesTemperature = model => !/^gemini-(?:[3-9]|\d{2,})/.test(model);
+
 function geminiProvider(model, key) {
   return {
     name: `gemini:${model}`,
@@ -197,7 +199,7 @@ function geminiProvider(model, key) {
         { 'x-goog-api-key': key },
         {
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature, responseMimeType: 'application/json' },
+          generationConfig: { ...(takesTemperature(model) && { temperature }), responseMimeType: 'application/json' },
         }
       );
       const parts = data.candidates?.[0]?.content?.parts ?? [];
@@ -229,23 +231,30 @@ function groqProvider(model, key) {
   };
 }
 
-// Gemini first (stronger at Sanskrit), then its lighter model (separate quota),
-// then Groq if a key is configured.
+// Each Gemini model has its own free daily quota (20 requests/day/model), so
+// a chain of models multiplies the daily budget; a model that is out of quota,
+// retired (404) or overloaded is skipped for the rest of the run. GEMINI_MODELS
+// (comma-separated, best first) overrides the chain. Groq is a last resort if
+// a key is configured.
+export const DEFAULT_GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-3-flash-preview', 'gemini-flash-latest', 'gemini-2.5-flash-lite'];
+
 export function buildProviders(env) {
   const providers = [];
   if (env.GEMINI_API_KEY) {
-    const primary = env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const fallback = env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-flash-lite';
-    providers.push(geminiProvider(primary, env.GEMINI_API_KEY));
-    if (fallback !== primary) providers.push(geminiProvider(fallback, env.GEMINI_API_KEY));
+    const models = (env.GEMINI_MODELS || '').split(',').map(m => m.trim()).filter(Boolean);
+    for (const model of [...new Set(models.length ? models : DEFAULT_GEMINI_MODELS)]) {
+      providers.push(geminiProvider(model, env.GEMINI_API_KEY));
+    }
   }
   if (env.GROQ_API_KEY) providers.push(groqProvider(env.GROQ_MODEL || 'llama-3.3-70b-versatile', env.GROQ_API_KEY));
   return providers;
 }
 
 // p.out marks a provider unusable for the rest of the run: 'permanent' (bad
-// key, unknown model) or 'quota' (daily quota spent — fine again tomorrow).
-async function generateText(prompt, { providers, log, backoffMs, deadline, minGapMs = MIN_GAP_MS }, temperature = 0.9) {
+// key, retired model), 'quota' (daily quota spent — fine again tomorrow) or
+// 'unavailable' (overloaded / timing out through all its retries).
+async function generateText(prompt, ctx, temperature = 0.7) {
+  const { providers, log, backoffMs, deadline, minGapMs = MIN_GAP_MS } = ctx;
   let lastErr = null;
   const checkBudget = () => {
     if (Date.now() > deadline) throw new GenerationError('time budget exhausted', true);
@@ -259,7 +268,9 @@ async function generateText(prompt, { providers, log, backoffMs, deadline, minGa
       checkBudget();
       p.lastCall = Date.now();
       try {
-        return { text: await p.call(prompt, { temperature }), provider: p.name };
+        const text = await p.call(prompt, { temperature });
+        ctx.apiCalls++;
+        return { text, provider: p.name };
       } catch (e) {
         lastErr = e;
         log(`  [${p.name}] ${e.message}`);
@@ -273,6 +284,8 @@ async function generateText(prompt, { providers, log, backoffMs, deadline, minGa
         }
       }
     }
+    // Out of retries (overloaded / timing out): don't spend the next calls' time on it again.
+    if (!p.out && failures >= TRIES_PER_PROVIDER) p.out = 'unavailable';
   }
   const allPermanent = providers.every(p => p.out === 'permanent');
   throw new GenerationError(`all providers failed (last error: ${lastErr?.message ?? 'none configured'})`, !allPermanent);
@@ -280,35 +293,51 @@ async function generateText(prompt, { providers, log, backoffMs, deadline, minGa
 
 /* ---------- prompting & validation ---------- */
 
-export function buildPrompt({ d, n, topics, avoid = [] }) {
-  const per = Math.ceil(n / topics.length);
-  const topicLines = topics.map(k => `  - "${k}": ${ALLOWED_TOPICS[k].label} — ${ALLOWED_TOPICS[k].desc}`).join('\n');
+// n questions split as evenly as possible over `keys` (30 over 10 topics → 3 each).
+export function splitEvenly(n, keys) {
+  const base = Math.floor(n / keys.length);
+  const extra = n % keys.length;
+  return Object.fromEntries(keys.map((k, i) => [k, base + (i < extra ? 1 : 0)]));
+}
+
+const sum = obj => Object.values(obj).reduce((s, v) => s + v, 0);
+
+// needs = { topicKey: howManyStillWanted }. One spare per topic is requested on
+// top, so questions lost to validation or review can be replaced without
+// another API call (calls are the scarce resource on the free tier).
+export function buildPrompt({ d, needs, avoid = [] }) {
+  const keys = Object.keys(needs).filter(k => needs[k] > 0);
+  const ask = Object.fromEntries(keys.map(k => [k, needs[k] + 1]));
+  const topicLines = keys
+    .map(k => `  - "${k}" (write exactly ${ask[k]}): ${ALLOWED_TOPICS[k].label} — ${ALLOWED_TOPICS[k].desc}`)
+    .join('\n');
   const avoidBlock = avoid.length
     ? `\nThese questions already exist — do not repeat or rephrase any of them:\n${avoid.map(q => `  - ${q}`).join('\n')}\n`
     : '';
 
-  return `You are a Sanskrit quizmaster writing for Sanskrit enthusiasts. Write exactly ${n} multiple-choice questions entirely in Sanskrit (Devanagari script only — no English, no transliteration, no Latin letters anywhere).
+  return `You are a Sanskrit quizmaster writing for Sanskrit enthusiasts. Write exactly ${sum(ask)} multiple-choice questions entirely in Sanskrit (Devanagari script only — no English, no transliteration, no Latin letters anywhere).
 
 Difficulty of every question: ${DIFFICULTY[d]}.
 
-Topic keys — use ONLY these, about ${per} questions each:
+Topic keys, with how many questions to write for each:
 ${topicLines}
 
 Question rules:
   - Every question must be factually accurate and unambiguous — only well-established facts. Do not invent facts.
+  - Before answering, re-check every question: the marked answer is certainly right, no other option is also right, and the Sanskrit is correct. Replace any question you are not sure about.
   - Exactly 4 answer options per question, all plausible, all distinct, all in Sanskrit.
   - The FIRST option in "a" must be the correct answer (the app shuffles options before display).
   - No duplicate or near-duplicate questions.
   - No numbering or labels inside the "q" text, and no hint of the answer in it.
 ${avoidBlock}
 Output STRICT JSON only — no markdown fences, no commentary. Shape exactly:
-{"questions":[{"t":"${topics[0]}","q":"...","a":["सम्यक् उत्तरम्","अशुद्धम् १","अशुद्धम् २","अशुद्धम् ३"]}]}`;
+{"questions":[{"t":"${keys[0]}","q":"...","a":["सम्यक् उत्तरम्","अशुद्धम् १","अशुद्धम् २","अशुद्धम् ३"]}]}`;
 }
 
 export function checkQuestion(item, topics) {
   if (!item || typeof item !== 'object') return 'not an object';
   const { t, q, a } = item;
-  if (!topics.includes(t)) return `topic "${t}" not allowed in this batch`;
+  if (!topics.includes(t)) return `topic "${t}" not requested`;
   if (typeof q !== 'string' || !q.trim() || !DEVANAGARI_RE.test(q)) return 'question text missing or not in Devanagari';
   if (LATIN_RE.test(q)) return 'question contains Latin letters';
   if (!Array.isArray(a) || a.length !== 4 || a.some(o => typeof o !== 'string' || !o.trim())) return 'needs exactly 4 non-empty options';
@@ -317,22 +346,56 @@ export function checkQuestion(item, topics) {
   return null;
 }
 
-// Parses one batch response and returns the usable questions (up to `limit`),
-// skipping invalid ones and anything already in `seen` (normalized text).
-export function parseBatch(raw, { d, topics }, seen, limit) {
-  let parsed;
-  try {
-    parsed = JSON.parse(stripFences(raw));
-  } catch (e) {
-    return { questions: [], errors: [`response was not valid JSON: ${e.message}`] };
+// Pulls every complete top-level {...} object out of the questions array of a
+// response that isn't valid JSON as a whole — typically one cut off mid-output.
+// A truncated reply then still yields its finished questions instead of
+// costing us a whole API call.
+export function salvageObjects(text) {
+  const from = text.indexOf('"questions"');
+  const start = text.indexOf('[', Math.max(0, from));
+  if (start < 0) return [];
+  const out = [];
+  let depth = 0, inStr = false, esc = false, objStart = -1;
+  for (let i = start + 1; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') { if (depth++ === 0) objStart = i; }
+    else if (c === '}' && depth > 0) {
+      if (--depth === 0) {
+        try { out.push(JSON.parse(text.slice(objStart, i + 1))); } catch { /* skip malformed object */ }
+        objStart = -1;
+      }
+    } else if (c === ']' && depth === 0) break;
   }
-  const list = Array.isArray(parsed) ? parsed : parsed?.questions;
-  if (!Array.isArray(list)) return { questions: [], errors: ['"questions" is not an array'] };
+  return out;
+}
 
+// Parses one generation response into valid, previously unseen questions.
+// `needs` says which topics were requested; `seen` (normalized text) is updated.
+export function parseBatch(raw, { d, needs }, seen) {
+  const text = stripFences(raw);
+  let list;
+  let note = null;
+  try {
+    const parsed = JSON.parse(text);
+    list = Array.isArray(parsed) ? parsed : parsed?.questions;
+    if (!Array.isArray(list)) return { questions: [], errors: ['"questions" is not an array'] };
+  } catch (e) {
+    list = salvageObjects(text);
+    if (!list.length) return { questions: [], errors: [`response was not valid JSON: ${e.message}`] };
+    note = `response was cut off — salvaged ${list.length} complete questions`;
+  }
+
+  const topics = Object.keys(needs).filter(k => needs[k] > 0);
   const questions = [];
-  const errors = [];
+  const errors = note ? [note] : [];
   for (const [i, item] of list.entries()) {
-    if (questions.length >= limit) break;
     const problem = checkQuestion(item, topics);
     if (problem) { errors.push(`#${i}: ${problem}`); continue; }
     const key = normalize(item.q);
@@ -343,34 +406,47 @@ export function parseBatch(raw, { d, topics }, seen, limit) {
   return { questions, errors };
 }
 
+// Splits candidates into those that fill a still-open slot (`picked`) and the
+// rest (`spare`), and returns what is still missing per topic.
+export function select(questions, needs) {
+  const left = { ...needs };
+  const picked = [];
+  const spare = [];
+  for (const q of questions) {
+    if (left[q.t] > 0) { left[q.t]--; picked.push(q); } else spare.push(q);
+  }
+  return { picked, spare, left };
+}
+
 export function buildReviewPrompt(questions) {
   const list = questions
     .map((q, i) => `${i}. ${q.q}\n   claimed correct: ${q.a[0]}\n   other options: ${q.a.slice(1).join(' | ')}`)
     .join('\n');
-  return `You are a strict Sanskrit scholar reviewing quiz questions before publication. For each numbered question below, the "claimed correct" option is presented as the only right answer.
+  return `You are a Sanskrit scholar reviewing quiz questions before publication. For each numbered question below, the "claimed correct" option is presented as the only right answer.
 
-Flag a question if ANY of these hold:
-  - the claimed correct answer is wrong, doubtful, or only true by some traditions;
-  - another option is also correct or arguably correct;
-  - the question is ambiguous, ungrammatical, or ill-formed Sanskrit;
+Flag a question only if you are confident that:
+  - the claimed correct answer is wrong; or
+  - another option is also correct, so the question has no single right answer; or
+  - the question is ambiguous or ill-formed enough that a scholar would object; or
   - the question text gives away the answer.
-When in doubt, flag it.
+Do not flag a question merely because it is hard, obscure, or you are slightly unsure.
 
 ${list}
 
 Output STRICT JSON only: {"bad":[<indices of flagged questions>]}`;
 }
 
-// Second-opinion fact check. Best-effort: if the review call itself fails, the
-// candidates are kept rather than failing the run over a quality pass.
+// Second-opinion fact check of all candidates in one call. Best-effort: if the
+// review call fails, the candidates are kept (reviewed:false) rather than
+// throwing away the questions already paid for.
 async function reviewQuestions(questions, ctx) {
-  if (!questions.length) return { keep: questions, flagged: 0 };
+  if (!questions.length) return { keep: questions, flagged: 0, reviewed: true };
   let text;
   try {
     ({ text } = await generateText(buildReviewPrompt(questions), ctx, 0));
   } catch (e) {
     ctx.log(`  review skipped: ${e.message}`);
-    return { keep: questions, flagged: 0 };
+    return { keep: questions, flagged: 0, reviewed: false };
   }
   let bad;
   try {
@@ -380,37 +456,123 @@ async function reviewQuestions(questions, ctx) {
   }
   if (!Array.isArray(bad)) {
     ctx.log('  review skipped: unparseable reviewer response');
-    return { keep: questions, flagged: 0 };
+    return { keep: questions, flagged: 0, reviewed: false };
   }
   const badSet = new Set(bad.map(Number));
   const keep = questions.filter((_, i) => !badSet.has(i));
-  return { keep, flagged: questions.length - keep.length };
+  return { keep, flagged: questions.length - keep.length, reviewed: true };
 }
 
-async function fillBatch(batch, ctx) {
-  const got = [];
-  const used = new Set();
-  const prior = ctx.recent.filter(q => q.d === batch.d && batch.topics.includes(q.t)).map(q => q.q);
+// One generation call per difficulty normally (a second only if some topics
+// came up short). Returns the questions that fill the slots plus spares.
+async function generateFor(d, needs, ctx, maxRounds = GEN_ROUNDS) {
+  let left = { ...needs };
+  const picked = [];
+  const spare = [];
+  const avoidBase = ctx.recent.filter(q => q.d === d).map(q => q.q);
 
-  for (let round = 1; round <= ROUNDS_PER_BATCH && got.length < batch.n; round++) {
-    const need = batch.n - got.length;
-    const ask = need + Math.max(EXTRA_PER_CALL, Math.ceil(need / 4));
-    const prompt = buildPrompt({ ...batch, n: ask, avoid: [...prior, ...got.map(q => q.q)] });
-    const { text, provider } = await generateText(prompt, ctx);
-    used.add(provider);
-    // Rejected questions stay in `seen`, so a wrong one proposed again is dropped too.
-    const { questions, errors } = parseBatch(text, batch, ctx.seen, ask);
-    const { keep, flagged } = await reviewQuestions(questions, ctx);
-    got.push(...keep.slice(0, need));
-    const notes = [errors.length && `dropped ${errors.length} (${errors.slice(0, 3).join('; ')})`, flagged && `review flagged ${flagged}`]
-      .filter(Boolean).join(', ');
-    ctx.log(`  round ${round} via ${provider}: +${Math.min(keep.length, need)} (${got.length}/${batch.n})${notes ? ` — ${notes}` : ''}`);
+  for (let round = 1; round <= maxRounds && sum(left) > 0; round++) {
+    const prompt = buildPrompt({ d, needs: left, avoid: [...avoidBase, ...picked.map(q => q.q), ...spare.map(q => q.q)] });
+    let text, provider;
+    try {
+      ({ text, provider } = await generateText(prompt, ctx));
+    } catch (e) {
+      if (round === 1 && !picked.length) throw e;
+      ctx.log(`  difficulty ${d}: giving up on top-up round ${round}: ${e.message}`);
+      break;
+    }
+    ctx.providersUsed.add(provider);
+    const { questions, errors } = parseBatch(text, { d, needs: left }, ctx.seen);
+    const sel = select(questions, left);
+    picked.push(...sel.picked);
+    spare.push(...sel.spare);
+    left = sel.left;
+    ctx.log(`  difficulty ${d} round ${round} via ${provider}: ${picked.length}/${sum(needs)} (+${spare.length} spare)${errors.length ? ` — dropped ${errors.length} (${errors.slice(0, 3).join('; ')})` : ''}`);
+  }
+  return { picked, spare };
+}
+
+// Fills difficulty d's slots from reviewed questions: the picks first, then
+// spares of the same topic, then spares of any topic. Returns the final list
+// and how many slots are still empty.
+export function fillFrom(goodPicked, goodSpare, needs, target) {
+  const final = [...goodPicked];
+  const spare = [...goodSpare];
+  const have = {};
+  for (const q of final) have[q.t] = (have[q.t] || 0) + 1;
+  for (const k of Object.keys(needs)) {
+    while ((have[k] || 0) < needs[k]) {
+      const i = spare.findIndex(q => q.t === k);
+      if (i < 0) break;
+      final.push(...spare.splice(i, 1));
+      have[k] = (have[k] || 0) + 1;
+    }
+  }
+  while (final.length < target && spare.length) final.push(spare.shift());
+  return { final, missing: Math.max(0, target - final.length) };
+}
+
+// Topic needs for `missing` extra questions: always the least-covered topics.
+export function topUpNeeds(final, missing) {
+  const have = Object.fromEntries(TOPIC_KEYS.map(k => [k, 0]));
+  for (const q of final) have[q.t]++;
+  const needs = Object.fromEntries(TOPIC_KEYS.map(k => [k, 0]));
+  for (let i = 0; i < missing; i++) {
+    const k = TOPIC_KEYS.reduce((a, b) => (have[a] + needs[a] <= have[b] + needs[b] ? a : b));
+    needs[k]++;
+  }
+  return needs;
+}
+
+// Builds the whole set: 3 generation calls + 1 review call, plus (only if
+// reviewed-out questions couldn't be covered by spares) up to 3 small top-up
+// calls and 1 more review call.
+export async function buildSet(ctx) {
+  const plan = DIFFICULTY_COUNTS.map((n, d) => ({ d, n, needs: splitEvenly(n, TOPIC_KEYS) }));
+
+  const gen = [];
+  for (const p of plan) {
+    ctx.log(`Generating ${p.n} × difficulty ${p.d}`);
+    gen.push(await generateFor(p.d, p.needs, ctx));
   }
 
-  if (got.length < batch.n) {
-    throw new GenerationError(`batch d=${batch.d} [${batch.topics}] only produced ${got.length}/${batch.n} valid questions`, true);
+  const cands = gen.flatMap((g, i) => [
+    ...g.picked.map(q => ({ q, d: i, spare: false })),
+    ...g.spare.map(q => ({ q, d: i, spare: true })),
+  ]);
+  ctx.log(`Reviewing ${cands.length} candidates`);
+  const review = await reviewQuestions(cands.map(c => c.q), ctx);
+  ctx.reviewed = review.reviewed;
+  const kept = new Set(review.keep);
+  ctx.log(`  review flagged ${review.flagged}`);
+
+  const finals = plan.map(p => {
+    const mine = cands.filter(c => c.d === p.d && kept.has(c.q));
+    return fillFrom(mine.filter(c => !c.spare).map(c => c.q), mine.filter(c => c.spare).map(c => c.q), p.needs, p.n);
+  });
+
+  // Rare: spares didn't cover everything the reviewer rejected.
+  const gaps = finals.map((f, d) => ({ d, missing: f.missing })).filter(g => g.missing > 0);
+  if (gaps.length) {
+    ctx.log(`Topping up ${gaps.map(g => `${g.missing} × difficulty ${g.d}`).join(', ')}`);
+    const fresh = [];
+    for (const g of gaps) {
+      try {
+        const res = await generateFor(g.d, topUpNeeds(finals[g.d].final, g.missing), ctx, 2);
+        fresh.push(...res.picked, ...res.spare);
+      } catch (e) {
+        ctx.log(`  top-up for difficulty ${g.d} failed: ${e.message}`);
+      }
+    }
+    const { keep } = await reviewQuestions(fresh, ctx);
+    for (const g of gaps) {
+      const add = keep.filter(q => q.d === g.d).slice(0, g.missing);
+      finals[g.d].final.push(...add);
+      finals[g.d].missing -= add.length;
+    }
   }
-  return { questions: got, providers: [...used] };
+
+  return finals.flatMap(f => f.final);
 }
 
 /* ---------- index.html rewriting ---------- */
@@ -522,17 +684,19 @@ export async function main({
   const recent = readArchive(archiveDir).slice(-RECENT_SETS).flatMap(s => s.questions);
   const seen = new Set(recent.map(q => normalize(q.q)));
 
-  const ctx = { providers, seen, recent, log, backoffMs, minGapMs, deadline: Date.now() + budgetMs };
-  const questions = [];
-  const usedProviders = new Set();
-  for (const [i, batch] of BATCHES.entries()) {
-    log(`Batch ${i + 1}/${BATCHES.length}: ${batch.n} × difficulty ${batch.d}, topics ${batch.topics.join(',')}`);
-    const res = await fillBatch(batch, ctx);
-    questions.push(...res.questions);
-    res.providers.forEach(p => usedProviders.add(p));
+  const ctx = {
+    providers, seen, recent, log, backoffMs, minGapMs,
+    deadline: Date.now() + budgetMs,
+    providersUsed: new Set(),
+    apiCalls: 0,
+    reviewed: true,
+  };
+  const questions = await buildSet(ctx);
+  if (questions.length < MIN_TOTAL) {
+    throw new GenerationError(`only ${questions.length} usable questions after review (need at least ${MIN_TOTAL})`, true);
   }
 
-  const providerLabel = [...usedProviders].join(', ');
+  const providerLabel = [...ctx.providersUsed].join(', ');
   const usedKeys = Object.keys(ALLOWED_TOPICS).filter(k => questions.some(q => q.t === k));
   let updated = spliceBetween(html, SET_START, SET_END, buildSetBlock(today));
   updated = spliceBetween(updated, TOPICS_START, TOPICS_END, buildTopicsBlock(usedKeys));
@@ -547,10 +711,14 @@ export async function main({
   for (const q of questions) topicCounts[q.t] = (topicCounts[q.t] || 0) + 1;
   writeFileSync(
     lastRunFile,
-    JSON.stringify({ date: today, previousSet: setId, plays, provider: providerLabel, status: 'OK', total: questions.length, topicCounts }, null, 2) + '\n'
+    JSON.stringify({
+      date: today, previousSet: setId, plays, provider: providerLabel,
+      apiCalls: ctx.apiCalls, reviewed: ctx.reviewed,
+      status: 'OK', total: questions.length, topicCounts,
+    }, null, 2) + '\n'
   );
 
-  return { status: 'refreshed', reason: `new set ${today} (${questions.length} questions via ${providerLabel})` };
+  return { status: 'refreshed', reason: `new set ${today} (${questions.length} questions via ${providerLabel}, ${ctx.apiCalls} API calls${ctx.reviewed ? '' : ', NOT reviewed'})` };
 }
 
 function summary(line) {

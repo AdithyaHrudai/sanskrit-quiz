@@ -54,8 +54,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_MODEL: ${{ secrets.GROQ_MODEL }}
-          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
-          GEMINI_FALLBACK_MODEL: ${{ secrets.GEMINI_FALLBACK_MODEL }}
+          GEMINI_MODELS: ${{ vars.GEMINI_MODELS }}
           FORCE_REFRESH: ${{ inputs.force }}
           FINAL_ATTEMPT: ${{ github.event_name != 'schedule' || github.event.schedule == '30 10 * * *' }}
         run: node scripts/generate-questions.mjs

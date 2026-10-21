@@ -1,16 +1,17 @@
 // Offline checks for scripts/generate-questions.mjs — no API keys or network.
 // Run: node scripts/test-dryrun.mjs
-import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, readdirSync, cpSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import {
-  BATCHES, TOTAL, COUNTER_NS, GenerationError, istDate, readSetId, stripFences,
-  checkQuestion, parseBatch, buildPrompt, buildReviewPrompt, rateLimitError, daysBetween, shouldFail, main,
+  ALLOWED_TOPICS, TOTAL, COUNTER_NS, DEFAULT_GEMINI_MODELS, GenerationError, istDate, readSetId, stripFences,
+  splitEvenly, buildPrompt, buildReviewPrompt, checkQuestion, salvageObjects, parseBatch, select, fillFrom, topUpNeeds,
+  buildProviders, rateLimitError, daysBetween, shouldFail, main,
 } from './generate-questions.mjs';
 
-const ROOT = new URL('..', import.meta.url);
-const realHtml = readFileSync(new URL('index.html', ROOT), 'utf8');
+const realHtml = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const TOPICS = Object.keys(ALLOWED_TOPICS);
 
 // --- helpers ---
 assert.equal(stripFences('```json\n{"a":1}\n```'), '{"a":1}');
@@ -19,7 +20,8 @@ assert.equal(istDate(new Date('2026-10-20T18:31:00Z')), '2026-10-21', 'IST rolls
 assert.match(readSetId(realHtml), /^\d{4}-\d{2}-\d{2}$/);
 assert.ok(realHtml.includes(`const COUNTER_NS = '${COUNTER_NS}';`), 'index.html and script must share COUNTER_NS');
 assert.equal(TOTAL, 100);
-assert.deepEqual([0, 1, 2].map(d => BATCHES.filter(b => b.d === d).reduce((s, b) => s + b.n, 0)), [30, 40, 30]);
+assert.deepEqual(splitEvenly(30, TOPICS), Object.fromEntries(TOPICS.map(k => [k, 3])));
+assert.deepEqual(Object.values(splitEvenly(43, TOPICS)).reduce((a, b) => a + b, 0), 43);
 console.log('helpers: OK');
 
 // --- failure reporting: when is a failed (= emailed) run warranted? ---
@@ -39,31 +41,97 @@ console.log('helpers: OK');
 }
 console.log('shouldFail(): OK');
 
+// --- 429 parsing (shape of a real Gemini free-tier response) ---
+{
+  const body = JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota ... Please retry in 37.5s.', details: [
+    { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }] },
+    { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '37s' },
+  ] } });
+  const e = rateLimitError(body, null);
+  assert.equal(e.rateLimited, true);
+  assert.equal(e.daily, false);
+  assert.equal(e.retryAfterMs, 37_000);
+  assert.match(e.message, /PerMinute.*retry in 37s/);
+  assert.equal(rateLimitError(body.replace('PerMinute', 'PerDay'), null).daily, true);
+  assert.equal(rateLimitError('not json', '12').retryAfterMs, 12_000, 'falls back to Retry-After header');
+}
+console.log('rateLimitError(): OK');
+
+// --- providers ---
+{
+  assert.deepEqual(buildProviders({ GEMINI_API_KEY: 'k' }).map(p => p.name), DEFAULT_GEMINI_MODELS.map(m => `gemini:${m}`));
+  assert.deepEqual(buildProviders({ GEMINI_API_KEY: 'k', GEMINI_MODELS: ' a , b,a ' }).map(p => p.name), ['gemini:a', 'gemini:b']);
+  assert.deepEqual(buildProviders({ GROQ_API_KEY: 'g' }).map(p => p.name), ['groq:llama-3.3-70b-versatile']);
+  assert.deepEqual(buildProviders({}), []);
+}
+console.log('buildProviders(): OK');
+
 // --- per-question validation ---
 const good = { t: 'vy', q: 'रामस्य पिता कः ?', a: ['दशरथः', 'जनकः', 'वसिष्ठः', 'विश्वामित्रः'] };
 assert.equal(checkQuestion(good, ['vy']), null);
-assert.match(checkQuestion({ ...good, t: 'rc' }, ['vy']), /not allowed/);
+assert.match(checkQuestion({ ...good, t: 'rc' }, ['vy']), /not requested/);
 assert.match(checkQuestion({ ...good, q: 'Who is Rama?' }, ['vy']), /Devanagari/);
 assert.match(checkQuestion({ ...good, q: 'रामस्य father कः ?' }, ['vy']), /Latin/);
 assert.match(checkQuestion({ ...good, a: good.a.slice(0, 3) }, ['vy']), /4/);
 assert.match(checkQuestion({ ...good, a: ['दशरथः', 'दशरथः ।', 'जनकः', 'वसिष्ठः'] }, ['vy']), /distinct/);
 console.log('checkQuestion(): OK');
 
-// --- tolerant batch parsing: drops bad / duplicate items, honours limit ---
+// --- truncated / malformed responses still yield their complete questions ---
+{
+  const full = JSON.stringify({ questions: [good, { ...good, q: 'सीतायाः पिता कः ?' }, { ...good, q: 'लक्ष्मणस्य माता का ?' }] });
+  const cut = full.slice(0, full.lastIndexOf('{') + 25); // dies in the middle of the third object
+  assert.throws(() => JSON.parse(cut));
+  assert.equal(salvageObjects(cut).length, 2);
+  assert.equal(salvageObjects('{"questions":[{"q":"a } b \\" {","a":[]}, {"q":"x"').length, 1, 'braces/quotes inside strings are respected');
+  assert.equal(salvageObjects('garbage').length, 0);
+  const { questions, errors } = parseBatch(cut, { d: 0, needs: { vy: 5 } }, new Set());
+  assert.equal(questions.length, 2);
+  assert.ok(errors.some(e => e.includes('cut off')));
+}
+console.log('salvageObjects(): OK');
+
+// --- tolerant batch parsing: drops bad / duplicate items ---
 {
   const seen = new Set();
-  const items = [good, { ...good, q: 'What?' }, { ...good }, { ...good, q: 'सीतायाः पिता कः ?' }, { ...good, q: 'लक्ष्मणस्य माता का ?' }];
-  const { questions, errors } = parseBatch('```json\n' + JSON.stringify({ questions: items }) + '\n```', { d: 1, topics: ['vy'] }, seen, 2);
+  const items = [good, { ...good, q: 'What?' }, { ...good }, { ...good, q: 'सीतायाः पिता कः ?' }, { ...good, t: 'rc', q: 'अन्यः प्रश्नः कः ?' }];
+  const { questions, errors } = parseBatch('```json\n' + JSON.stringify({ questions: items }) + '\n```', { d: 1, needs: { vy: 3, pu: 0 } }, seen);
   assert.equal(questions.length, 2);
   assert.ok(questions.every(q => q.d === 1));
-  assert.ok(errors.some(e => e.includes('duplicate')) && errors.some(e => e.includes('Devanagari')));
-  assert.equal(parseBatch('not json', { d: 0, topics: ['vy'] }, new Set(), 5).questions.length, 0);
+  assert.ok(['duplicate', 'Devanagari', 'not requested'].every(w => errors.some(e => e.includes(w))));
+  assert.equal(parseBatch('not json', { d: 0, needs: { vy: 1 } }, new Set()).questions.length, 0);
 }
 console.log('parseBatch(): OK');
 
+// --- slot selection and gap filling ---
+{
+  const mk = (t, n) => Array.from({ length: n }, (_, i) => ({ t, d: 0, q: `${t}${i}`, a: ['1', '2', '3', '4'] }));
+  const sel = select([...mk('vy', 4), ...mk('pu', 1)], { vy: 3, pu: 3 });
+  assert.equal(sel.picked.length, 4);
+  assert.equal(sel.spare.length, 1);
+  assert.deepEqual(sel.left, { vy: 0, pu: 2 });
+
+  // 2 'vy' lost in review: covered by same-topic spares first, then any-topic spares
+  const r1 = fillFrom(mk('vy', 1).concat(mk('pu', 3)), [...mk('vy', 1).map(q => ({ ...q, q: 'vyS' })), ...mk('su', 2)], { vy: 3, pu: 3 }, 6);
+  assert.equal(r1.final.length, 6);
+  assert.equal(r1.missing, 0);
+  assert.equal(r1.final.filter(q => q.t === 'vy').length, 2, 'only one same-topic spare existed');
+  assert.equal(fillFrom(mk('vy', 1), [], { vy: 3 }, 3).missing, 2);
+
+  const needs = topUpNeeds([...mk('vy', 5), ...mk('pu', 5)], 3);
+  assert.equal(Object.values(needs).reduce((a, b) => a + b, 0), 3);
+  assert.equal(needs.vy + needs.pu, 0, 'top-ups go to the least-covered topics');
+}
+console.log('select()/fillFrom()/topUpNeeds(): OK');
+
 // --- prompts ---
-assert.ok(buildPrompt({ ...BATCHES[0], avoid: ['पूर्वप्रश्नः ?'] }).includes('पूर्वप्रश्नः ?'));
-assert.ok(buildReviewPrompt([{ ...good, d: 0 }]).includes('claimed correct: दशरथः'));
+{
+  const p = buildPrompt({ d: 1, needs: { vy: 4, pu: 4, de: 0 }, avoid: ['पूर्वप्रश्नः ?'] });
+  assert.ok(p.includes('(write exactly 5): ' + ALLOWED_TOPICS.vy.label), 'one spare is requested per topic');
+  assert.ok(p.includes('Write exactly 10 multiple-choice'));
+  assert.ok(!p.includes('"de"'), 'topics with no remaining need are not requested');
+  assert.ok(p.includes('पूर्वप्रश्नः ?'));
+  assert.ok(buildReviewPrompt([{ ...good, d: 0 }]).includes('claimed correct: दशरथः'));
+}
 console.log('prompts: OK');
 
 // --- end-to-end against a temp copy of the repo ---
@@ -71,10 +139,11 @@ const DV = '०१२३४५६७८९';
 const dv = n => String(n).replace(/\d/g, d => DV[d]);
 let qCounter = 0;
 
-// Mock LLM: answers generation prompts with unique valid questions (plus one
-// junk item), and review prompts by flagging question 0 the first few times.
-function mockProvider(name, { failWith } = {}) {
-  let reviews = 0;
+// Mock LLM. Generation prompts get unique valid questions per topic (exactly as
+// many as asked) plus one junk item; review prompts flag the first `flagFirst`
+// questions on the first review call only.
+function mockProvider(name, { failWith, flagFirst = 0, truncate = false } = {}) {
+  let reviewCalls = 0;
   return {
     name,
     calls: 0,
@@ -83,15 +152,20 @@ function mockProvider(name, { failWith } = {}) {
       this.calls++;
       this.prompts.push(prompt);
       if (failWith) throw failWith;
-      if (prompt.includes('strict Sanskrit scholar')) return JSON.stringify({ bad: reviews++ < 3 ? [0] : [] });
-      const n = Number(prompt.match(/Write exactly (\d+) multiple-choice/)[1]);
-      const topics = [...prompt.matchAll(/^ {2}- "(\w\w)":/gm)].map(m => m[1]);
-      const questions = Array.from({ length: n }, (_, i) => {
-        const k = qCounter++;
-        return { t: topics[i % topics.length], q: `परीक्षाप्रश्नः ${dv(k)} किम् ?`, a: [`उत्तरम् ${dv(k)}क`, `उत्तरम् ${dv(k)}ख`, `उत्तरम् ${dv(k)}ग`, `उत्तरम् ${dv(k)}घ`] };
-      });
-      questions.push({ t: topics[0], q: 'English junk', a: ['a', 'b', 'c', 'd'] });
-      return JSON.stringify({ questions });
+      if (prompt.includes('scholar reviewing quiz questions')) {
+        const n = (prompt.match(/^\d+\. /gm) || []).length;
+        return JSON.stringify({ bad: reviewCalls++ === 0 ? Array.from({ length: Math.min(flagFirst, n) }, (_, i) => i) : [] });
+      }
+      const questions = [];
+      for (const m of prompt.matchAll(/^ {2}- "(\w\w)" \(write exactly (\d+)\)/gm)) {
+        for (let i = 0; i < Number(m[2]); i++) {
+          const k = qCounter++;
+          questions.push({ t: m[1], q: `परीक्षाप्रश्नः ${dv(k)} किम् ?`, a: [`उत्तरम् ${dv(k)}क`, `उत्तरम् ${dv(k)}ख`, `उत्तरम् ${dv(k)}ग`, `उत्तरम् ${dv(k)}घ`] });
+        }
+      }
+      questions.push({ t: questions[0].t, q: 'English junk', a: ['a', 'b', 'c', 'd'] });
+      const json = JSON.stringify({ questions });
+      return truncate ? json.slice(0, json.length - 40) : json;
     },
   };
 }
@@ -120,28 +194,17 @@ const NOW = new Date('2026-10-22T03:00:00Z'); // 08:30 IST on 2026-10-22
 const quiet = () => {};
 const opts = extra => ({ env: {}, now: NOW, log: quiet, backoffMs: [0], counterRetryMs: 0, minGapMs: 0, ...extra });
 
-// --- 429 parsing (shape of a real Gemini free-tier response) ---
-{
-  const body = JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota ... Please retry in 37.5s.', details: [
-    { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }] },
-    { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '37s' },
-  ] } });
-  const e = rateLimitError(body, null);
-  assert.equal(e.rateLimited, true);
-  assert.equal(e.daily, false);
-  assert.equal(e.retryAfterMs, 37_000);
-  assert.match(e.message, /PerMinute.*retry in 37s/);
-  const daily = rateLimitError(body.replace('PerMinute', 'PerDay'), null);
-  assert.equal(daily.daily, true);
-  assert.equal(rateLimitError('not json', '12').retryAfterMs, 12_000, 'falls back to Retry-After header');
-}
-console.log('rateLimitError(): OK');
-
 function limited({ daily = false } = {}) {
   const e = new GenerationError('HTTP 429', true);
   Object.assign(e, { rateLimited: true, daily, retryAfterMs: 0 });
   return e;
 }
+
+const loadBank = html => {
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  new Function(script); // syntax check only
+  return new Function(script.slice(0, script.indexOf('/* ---------- refresh signal')) + 'return BANK;')();
+};
 
 // skip: set is already today's
 {
@@ -160,7 +223,7 @@ function limited({ daily = false } = {}) {
   assert.equal(r.status, 'skipped');
   assert.match(r.reason, /nobody/);
   assert.equal(p.calls, 0, 'no LLM calls when nobody played');
-  assert.equal(readFileSync(path.join(dir, 'index.html'), 'utf8').includes("const SET_ID = '2026-10-20';"), true);
+  assert.ok(readFileSync(path.join(dir, 'index.html'), 'utf8').includes("const SET_ID = '2026-10-20';"));
   rmSync(dir, { recursive: true });
 }
 // counter unreachable → transient error (retried by a later slot)
@@ -171,51 +234,106 @@ function limited({ daily = false } = {}) {
 }
 console.log('main() skip paths: OK');
 
-// refresh: first provider overloaded (503), second has a bad key (403), third works
+// happy path: exactly 4 API calls (3 generation + 1 review), balanced set
 {
   const dir = tempRepo('2026-10-20');
-  const overloaded = mockProvider('overloaded', { failWith: new GenerationError('HTTP 503', true) });
-  const badKey = mockProvider('bad-key', { failWith: new GenerationError('HTTP 403', false) });
-  const ok = mockProvider('ok');
-  const r = await main(opts({ root: dir, providers: [overloaded, badKey, ok], fetchFn: counter(2) }));
+  const p = mockProvider('ok');
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(2) }));
   assert.equal(r.status, 'refreshed', r.reason);
-  assert.equal(badKey.calls, 1, 'a permanently failing provider is tried once, then skipped');
-  // easy group-A prompt lists recent archived easy "vy" questions (last 10 sets only)
-  const easyA = ok.prompts.find(p => p.includes('Difficulty of every question: easy') && p.includes('"vy"'));
-  assert.ok(easyA.includes('पुरातनः ३१ ?') && easyA.includes('पुरातनः २२ ?'), 'recent sets go in the avoid list');
-  assert.ok(!easyA.includes('पुरातनः २१ ?'), 'older sets are not');
-  assert.ok(!ok.prompts.find(p => p.includes('Difficulty of every question: hard')).includes('पुरातनः'), 'avoid list is per difficulty');
+  assert.equal(p.calls, 4, 'API calls are the scarce resource: 3 generation + 1 review');
 
   const html = readFileSync(path.join(dir, 'index.html'), 'utf8');
   assert.equal(readSetId(html), '2026-10-22');
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
-  new Function(script); // syntax check only
-  const bank = new Function(script.slice(0, script.indexOf('/* ---------- helpers')) + 'return BANK;')();
+  const bank = loadBank(html);
   assert.equal(bank.length, 100);
   assert.deepEqual([0, 1, 2].map(d => bank.filter(q => q.d === d).length), [30, 40, 30]);
+  assert.ok(TOPICS.every(k => bank.filter(q => q.t === k).length === 10), 'every topic has exactly 10 questions');
   assert.equal(new Set(bank.map(q => q.q)).size, 100);
   assert.ok(!bank.some(q => q.q === 'English junk'));
   assert.ok(!realHtml.includes('परीक्षाप्रश्नः') && html.includes('परीक्षाप्रश्नः'));
+
+  // the avoid list shows recent archived easy questions (last 10 sets only), per difficulty
+  const easy = p.prompts.find(x => x.includes('Difficulty of every question: easy'));
+  assert.ok(easy.includes('पुरातनः ३१ ?') && easy.includes('पुरातनः २२ ?'), 'recent sets go in the avoid list');
+  assert.ok(!easy.includes('पुरातनः २१ ?'), 'older sets are not');
+  assert.ok(!p.prompts.find(x => x.includes('Difficulty of every question: hard')).includes('पुरातनः'), 'avoid list is per difficulty');
 
   const archive = readdirSync(path.join(dir, 'data', 'questions-archive'));
   assert.equal(archive.length, 30, 'archive pruned to newest 30');
   assert.ok(archive.includes('2026-10-22.json') && !archive.includes('2026-08-01.json'));
   const last = JSON.parse(readFileSync(path.join(dir, 'data', 'last-run.json'), 'utf8'));
-  assert.equal(last.previousSet, '2026-10-20');
-  assert.equal(last.plays, 2);
+  assert.deepEqual([last.previousSet, last.plays, last.apiCalls, last.reviewed], ['2026-10-20', 2, 4, true]);
   rmSync(dir, { recursive: true });
 }
-console.log('main() refresh with provider fallback + review: OK');
+console.log('main() happy path (4 calls, balanced set): OK');
 
-// every provider has a bad key → permanent (non-transient) error, index.html untouched
+// reviewer rejects 8 questions: spares cover them, still 4 calls
 {
   const dir = tempRepo('2026-10-20');
-  const before = readFileSync(path.join(dir, 'index.html'), 'utf8');
-  await assert.rejects(
-    main(opts({ root: dir, providers: [mockProvider('x', { failWith: new GenerationError('HTTP 400', false) })], fetchFn: counter(1) })),
-    e => e.transient === false
-  );
-  assert.equal(readFileSync(path.join(dir, 'index.html'), 'utf8'), before);
+  const p = mockProvider('ok', { flagFirst: 8 });
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.equal(p.calls, 4, 'spares absorb review rejections without extra calls');
+  assert.equal(loadBank(readFileSync(path.join(dir, 'index.html'), 'utf8')).length, 100);
+  rmSync(dir, { recursive: true });
+}
+// reviewer rejects more than the spares can cover (12 easy ones; only 10 spares): a small top-up fills the gap
+{
+  const dir = tempRepo('2026-10-20');
+  const p = mockProvider('ok', { flagFirst: 12 });
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.ok(p.calls > 4 && p.calls <= 7, `top-up used ${p.calls} calls`);
+  assert.equal(loadBank(readFileSync(path.join(dir, 'index.html'), 'utf8')).length, 100);
+  rmSync(dir, { recursive: true });
+}
+// reviewer rejects a huge share of everything: the run still finishes within a sane call budget
+{
+  const dir = tempRepo('2026-10-20');
+  const p = mockProvider('ok', { flagFirst: 70 });
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.ok(p.calls > 4 && p.calls <= 10, `top-ups used ${p.calls} calls`);
+  const bank = loadBank(readFileSync(path.join(dir, 'index.html'), 'utf8'));
+  assert.ok(bank.length >= 90, `got ${bank.length}`);
+  rmSync(dir, { recursive: true });
+}
+// truncated responses: complete questions are salvaged, gaps topped up
+{
+  const dir = tempRepo('2026-10-20');
+  const p = mockProvider('ok', { truncate: true });
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.ok(loadBank(readFileSync(path.join(dir, 'index.html'), 'utf8')).length >= 90);
+  rmSync(dir, { recursive: true });
+}
+// review call itself fails: the set is still published, marked unreviewed
+{
+  const dir = tempRepo('2026-10-20');
+  const p = mockProvider('ok');
+  const inner = p.call;
+  p.call = async function (prompt) {
+    if (prompt.includes('scholar reviewing')) throw new GenerationError('HTTP 400', false);
+    return inner.call(this, prompt);
+  };
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.match(r.reason, /NOT reviewed/);
+  assert.equal(JSON.parse(readFileSync(path.join(dir, 'data', 'last-run.json'), 'utf8')).reviewed, false);
+  rmSync(dir, { recursive: true });
+}
+console.log('main() review edge cases: OK');
+
+// provider chain: overloaded (503), retired model (404), then a working one
+{
+  const dir = tempRepo('2026-10-20');
+  const overloaded = mockProvider('overloaded', { failWith: new GenerationError('HTTP 503', true) });
+  const gone = mockProvider('gone', { failWith: new GenerationError('HTTP 404', false) });
+  const ok = mockProvider('ok');
+  const r = await main(opts({ root: dir, providers: [overloaded, gone, ok], fetchFn: counter(2) }));
+  assert.equal(r.status, 'refreshed', r.reason);
+  assert.equal(gone.calls, 1, 'a retired model is tried once, then skipped for the rest of the run');
+  assert.equal(overloaded.calls, 3, 'an overloaded model is retried 3 times on the first call, then skipped');
   rmSync(dir, { recursive: true });
 }
 // per-minute 429s: wait and retry the same model rather than falling back
@@ -234,12 +352,35 @@ console.log('main() refresh with provider fallback + review: OK');
   assert.equal(fallback.calls, 0, 'per-minute rate limits never push work to the fallback model');
   rmSync(dir, { recursive: true });
 }
-// daily quota spent on every model → transient (a later slot / tomorrow retries)
+// daily quota spent on the first model → moves straight to the next one
 {
   const dir = tempRepo('2026-10-20');
-  const p = mockProvider('x', { failWith: limited({ daily: true }) });
-  await assert.rejects(main(opts({ root: dir, providers: [p], fetchFn: counter(1) })), e => e.transient === true);
-  assert.equal(p.calls, 1, 'a model out of daily quota is not retried');
+  const spent = mockProvider('spent', { failWith: limited({ daily: true }) });
+  const next = mockProvider('next');
+  const r = await main(opts({ root: dir, providers: [spent, next], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.equal(spent.calls, 1, 'a model out of daily quota is not retried');
+  rmSync(dir, { recursive: true });
+}
+// daily quota spent on every model → transient (a later slot / tomorrow retries), index.html untouched
+{
+  const dir = tempRepo('2026-10-20');
+  const before = readFileSync(path.join(dir, 'index.html'), 'utf8');
+  await assert.rejects(main(opts({ root: dir, providers: [mockProvider('x', { failWith: limited({ daily: true }) })], fetchFn: counter(1) })), e => e.transient === true);
+  assert.equal(readFileSync(path.join(dir, 'index.html'), 'utf8'), before);
+  rmSync(dir, { recursive: true });
+}
+console.log('main() provider chain + quota handling: OK');
+
+// every provider has a bad key → permanent (non-transient) error, index.html untouched
+{
+  const dir = tempRepo('2026-10-20');
+  const before = readFileSync(path.join(dir, 'index.html'), 'utf8');
+  await assert.rejects(
+    main(opts({ root: dir, providers: [mockProvider('x', { failWith: new GenerationError('HTTP 400', false) })], fetchFn: counter(1) })),
+    e => e.transient === false
+  );
+  assert.equal(readFileSync(path.join(dir, 'index.html'), 'utf8'), before);
   rmSync(dir, { recursive: true });
 }
 // force refresh ignores the counter
