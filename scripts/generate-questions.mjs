@@ -236,7 +236,7 @@ function groqProvider(model, key) {
 // retired (404) or overloaded is skipped for the rest of the run. GEMINI_MODELS
 // (comma-separated, best first) overrides the chain. Groq is a last resort if
 // a key is configured.
-export const DEFAULT_GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-3-flash-preview', 'gemini-flash-latest', 'gemini-2.5-flash-lite'];
+export const DEFAULT_GEMINI_MODELS = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.5-flash-lite'];
 
 export function buildProviders(env) {
   const providers = [];
@@ -253,8 +253,12 @@ export function buildProviders(env) {
 // p.out marks a provider unusable for the rest of the run: 'permanent' (bad
 // key, retired model), 'quota' (daily quota spent — fine again tomorrow) or
 // 'unavailable' (overloaded / timing out through all its retries).
-async function generateText(prompt, ctx, temperature = 0.7) {
-  const { providers, log, backoffMs, deadline, minGapMs = MIN_GAP_MS } = ctx;
+// `preferNot` (a Set of provider names) moves those to the back of the line, so
+// the review can be done by a different model than the one that wrote the
+// questions — a model tends to repeat its own mistakes when checking itself.
+async function generateText(prompt, ctx, temperature = 0.7, preferNot = new Set()) {
+  const { log, backoffMs, deadline, minGapMs = MIN_GAP_MS } = ctx;
+  const providers = [...ctx.providers].sort((a, b) => preferNot.has(a.name) - preferNot.has(b.name));
   let lastErr = null;
   const checkBudget = () => {
     if (Date.now() > deadline) throw new GenerationError('time budget exhausted', true);
@@ -443,7 +447,7 @@ async function reviewQuestions(questions, ctx) {
   if (!questions.length) return { keep: questions, flagged: 0, reviewed: true };
   let text;
   try {
-    ({ text } = await generateText(buildReviewPrompt(questions), ctx, 0));
+    ({ text } = await generateText(buildReviewPrompt(questions), ctx, 0, ctx.providersUsed));
   } catch (e) {
     ctx.log(`  review skipped: ${e.message}`);
     return { keep: questions, flagged: 0, reviewed: false };

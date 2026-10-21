@@ -336,6 +336,26 @@ console.log('main() review edge cases: OK');
   assert.equal(overloaded.calls, 3, 'an overloaded model is retried 3 times on the first call, then skipped');
   rmSync(dir, { recursive: true });
 }
+// the review goes to a different model than the one that generated, when there is one
+{
+  const dir = tempRepo('2026-10-20');
+  const writer = mockProvider('writer');
+  const checker = mockProvider('checker');
+  const r = await main(opts({ root: dir, providers: [writer, checker], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.equal(writer.calls, 3, 'the first model writes all three difficulties');
+  assert.equal(checker.calls, 1, 'an independent model does the review');
+  assert.ok(checker.prompts[0].includes('scholar reviewing'));
+  rmSync(dir, { recursive: true });
+}
+// ...and the same model reviews when it is the only one left
+{
+  const dir = tempRepo('2026-10-20');
+  const only = mockProvider('only');
+  await main(opts({ root: dir, providers: [only], fetchFn: counter(1) }));
+  assert.equal(only.calls, 4);
+  rmSync(dir, { recursive: true });
+}
 // per-minute 429s: wait and retry the same model rather than falling back
 {
   const dir = tempRepo('2026-10-20');
@@ -349,7 +369,7 @@ console.log('main() review edge cases: OK');
   const fallback = mockProvider('fallback');
   const r = await main(opts({ root: dir, providers: [primary, fallback], fetchFn: counter(1) }));
   assert.equal(r.status, 'refreshed');
-  assert.equal(fallback.calls, 0, 'per-minute rate limits never push work to the fallback model');
+  assert.ok(fallback.prompts.every(p => p.includes('scholar reviewing')), 'per-minute rate limits never push generation to the fallback model');
   rmSync(dir, { recursive: true });
 }
 // daily quota spent on the first model → moves straight to the next one
