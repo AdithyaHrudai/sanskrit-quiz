@@ -1,82 +1,183 @@
-import { readFileSync } from 'node:fs';
+// Offline checks for scripts/generate-questions.mjs — no API keys or network.
+// Run: node scripts/test-dryrun.mjs
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, readdirSync, cpSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import assert from 'node:assert/strict';
-import { ALLOWED_TOPICS, validate, buildTopicsBlock, buildQuestionsBlock, spliceBetween, stripFences } from './generate-questions.mjs';
+import {
+  BATCHES, TOTAL, COUNTER_NS, GenerationError, istDate, readSetId, stripFences,
+  checkQuestion, parseBatch, buildPrompt, buildReviewPrompt, main,
+} from './generate-questions.mjs';
 
-// --- stripFences ---
+const ROOT = new URL('..', import.meta.url);
+const realHtml = readFileSync(new URL('index.html', ROOT), 'utf8');
+
+// --- helpers ---
 assert.equal(stripFences('```json\n{"a":1}\n```'), '{"a":1}');
-assert.equal(stripFences('{"a":1}'), '{"a":1}');
+assert.equal(istDate(new Date('2026-10-20T18:29:00Z')), '2026-10-20');
+assert.equal(istDate(new Date('2026-10-20T18:31:00Z')), '2026-10-21', 'IST rolls over at 18:30 UTC');
+assert.match(readSetId(realHtml), /^\d{4}-\d{2}-\d{2}$/);
+assert.ok(realHtml.includes(`const COUNTER_NS = '${COUNTER_NS}';`), 'index.html and script must share COUNTER_NS');
+assert.equal(TOTAL, 100);
+assert.deepEqual([0, 1, 2].map(d => BATCHES.filter(b => b.d === d).reduce((s, b) => s + b.n, 0)), [30, 40, 30]);
+console.log('helpers: OK');
 
-// --- build a fake but schema-valid 100-question payload ---
-const topicKeys = Object.keys(ALLOWED_TOPICS);
-function mkQ(i, d) {
-  const t = topicKeys[i % topicKeys.length];
-  return { t, d, q: `प्रश्नः संख्या ${i} किम् अस्ति ?`, a: [`उत्तरम्${i}क`, `उत्तरम्${i}ख`, `उत्तरम्${i}ग`, `उत्तरम्${i}घ`] };
+// --- per-question validation ---
+const good = { t: 'vy', q: 'रामस्य पिता कः ?', a: ['दशरथः', 'जनकः', 'वसिष्ठः', 'विश्वामित्रः'] };
+assert.equal(checkQuestion(good, ['vy']), null);
+assert.match(checkQuestion({ ...good, t: 'rc' }, ['vy']), /not allowed/);
+assert.match(checkQuestion({ ...good, q: 'Who is Rama?' }, ['vy']), /Devanagari/);
+assert.match(checkQuestion({ ...good, q: 'रामस्य father कः ?' }, ['vy']), /Latin/);
+assert.match(checkQuestion({ ...good, a: good.a.slice(0, 3) }, ['vy']), /4/);
+assert.match(checkQuestion({ ...good, a: ['दशरथः', 'दशरथः ।', 'जनकः', 'वसिष्ठः'] }, ['vy']), /distinct/);
+console.log('checkQuestion(): OK');
+
+// --- tolerant batch parsing: drops bad / duplicate items, honours limit ---
+{
+  const seen = new Set();
+  const items = [good, { ...good, q: 'What?' }, { ...good }, { ...good, q: 'सीतायाः पिता कः ?' }, { ...good, q: 'लक्ष्मणस्य माता का ?' }];
+  const { questions, errors } = parseBatch('```json\n' + JSON.stringify({ questions: items }) + '\n```', { d: 1, topics: ['vy'] }, seen, 2);
+  assert.equal(questions.length, 2);
+  assert.ok(questions.every(q => q.d === 1));
+  assert.ok(errors.some(e => e.includes('duplicate')) && errors.some(e => e.includes('Devanagari')));
+  assert.equal(parseBatch('not json', { d: 0, topics: ['vy'] }, new Set(), 5).questions.length, 0);
 }
-const questions = [];
-let i = 0;
-for (let e = 0; e < 30; e++) questions.push(mkQ(i++, 0));
-for (let m = 0; m < 40; m++) questions.push(mkQ(i++, 1));
-for (let h = 0; h < 30; h++) questions.push(mkQ(i++, 2));
+console.log('parseBatch(): OK');
 
-const raw = JSON.stringify({ questions });
-const result = validate(raw);
-assert.equal(result.ok, true, `validation should pass: ${JSON.stringify(result.errors)}`);
-assert.equal(result.questions.length, 100);
-console.log('validate(): OK — 100/100 accepted');
+// --- prompts ---
+assert.ok(buildPrompt({ ...BATCHES[0], avoid: ['पूर्वप्रश्नः ?'] }).includes('पूर्वप्रश्नः ?'));
+assert.ok(buildReviewPrompt([{ ...good, d: 0 }]).includes('claimed correct: दशरथः'));
+console.log('prompts: OK');
 
-// --- reject wrong counts ---
-const bad = validate(JSON.stringify({ questions: questions.slice(0, 99) }));
-assert.equal(bad.ok, false);
-console.log('validate(): OK — correctly rejects wrong count');
+// --- end-to-end against a temp copy of the repo ---
+const DV = '०१२३४५६७८९';
+const dv = n => String(n).replace(/\d/g, d => DV[d]);
+let qCounter = 0;
 
-// --- reject duplicate questions ---
-const dupQuestions = questions.slice(0, 99).concat([questions[0]]);
-const dup = validate(JSON.stringify({ questions: dupQuestions }));
-assert.equal(dup.ok, false);
-assert.ok(dup.errors.some(e => e.includes('duplicate')));
-console.log('validate(): OK — correctly rejects duplicates');
+// Mock LLM: answers generation prompts with unique valid questions (plus one
+// junk item), and review prompts by flagging question 0 the first few times.
+function mockProvider(name, { failWith } = {}) {
+  let reviews = 0;
+  return {
+    name,
+    calls: 0,
+    async call(prompt) {
+      this.calls++;
+      if (failWith) throw failWith;
+      if (prompt.includes('strict Sanskrit scholar')) return JSON.stringify({ bad: reviews++ < 3 ? [0] : [] });
+      const n = Number(prompt.match(/Write exactly (\d+) multiple-choice/)[1]);
+      const topics = [...prompt.matchAll(/^ {2}- "(\w\w)":/gm)].map(m => m[1]);
+      const questions = Array.from({ length: n }, (_, i) => {
+        const k = qCounter++;
+        return { t: topics[i % topics.length], q: `परीक्षाप्रश्नः ${dv(k)} किम् ?`, a: [`उत्तरम् ${dv(k)}क`, `उत्तरम् ${dv(k)}ख`, `उत्तरम् ${dv(k)}ग`, `उत्तरम् ${dv(k)}घ`] };
+      });
+      questions.push({ t: topics[0], q: 'English junk', a: ['a', 'b', 'c', 'd'] });
+      return JSON.stringify({ questions });
+    },
+  };
+}
 
-// --- reject non-Devanagari ---
-const englishQuestions = questions.slice(0, 99).concat([{ t: 'vy', d: 2, q: 'What is this in English?', a: ['a', 'b', 'c', 'd'] }]);
-const eng = validate(JSON.stringify({ questions: englishQuestions }));
-assert.equal(eng.ok, false);
-console.log('validate(): OK — correctly rejects non-Devanagari');
+function tempRepo(setId) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'sq-test-'));
+  writeFileSync(path.join(dir, 'index.html'), realHtml.replace(/const SET_ID = '[^']*';/, `const SET_ID = '${setId}';`));
+  mkdirSync(path.join(dir, 'data', 'questions-archive'), { recursive: true });
+  // 31 archived sets so pruning has something to do
+  for (let i = 1; i <= 31; i++) {
+    const date = `2026-08-${String(i).padStart(2, '0')}`;
+    writeFileSync(path.join(dir, 'data', 'questions-archive', `${date}.json`), JSON.stringify([{ t: 'vy', d: 0, q: `पुरातनः ${dv(i)} ?`, a: ['क', 'ख', 'ग', 'घ'] }]));
+  }
+  return dir;
+}
 
-// --- build blocks ---
-const usedKeys = topicKeys; // all used since we cycled through all of them
-const topicsBlock = buildTopicsBlock(usedKeys);
-assert.ok(topicsBlock.startsWith('const T = {'));
-assert.ok(topicsBlock.trim().endsWith('};'));
-console.log('buildTopicsBlock(): OK');
+const counter = value => async url => {
+  assert.ok(url.includes(`/get/${COUNTER_NS}/set-`), `unexpected counter URL ${url}`);
+  if (value === 'down') throw new TypeError('fetch failed');
+  return value === null
+    ? { ok: false, status: 404, json: async () => ({ error: 'Key not found' }) }
+    : { ok: true, status: 200, json: async () => ({ value }) };
+};
 
-const qBlock = buildQuestionsBlock(result.questions, { date: '2026-07-08', provider: 'mock' });
-assert.ok(qBlock.startsWith('const BANK = ['));
-assert.ok(qBlock.trim().endsWith('];'));
-console.log('buildQuestionsBlock(): OK');
+const NOW = new Date('2026-10-22T03:00:00Z'); // 08:30 IST on 2026-10-22
+const quiet = () => {};
+const opts = extra => ({ env: {}, now: NOW, log: quiet, backoffMs: [0], counterRetryMs: 0, ...extra });
 
-// --- splice into a copy of the real index.html and confirm the result is valid JS ---
-const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
-let updated = spliceBetween(
-  html,
-  '/* AUTO-GENERATED:TOPICS:START — overwritten daily by scripts/generate-questions.mjs, do not hand-edit */',
-  '/* AUTO-GENERATED:TOPICS:END */',
-  topicsBlock
-);
-updated = spliceBetween(
-  updated,
-  '/* AUTO-GENERATED:QUESTIONS:START — overwritten daily by scripts/generate-questions.mjs, do not hand-edit */',
-  '/* AUTO-GENERATED:QUESTIONS:END */',
-  qBlock
-);
-assert.ok(updated.includes('प्रश्नः संख्या 0 किम्'), 'spliced content should be present');
-assert.ok(!updated.includes("श्रीरामस्य पत्नी"), 'old question content should be fully gone');
+// skip: set is already today's
+{
+  const dir = tempRepo('2026-10-22');
+  const p = mockProvider('mock');
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(5) }));
+  assert.equal(r.status, 'skipped');
+  assert.equal(p.calls, 0);
+  rmSync(dir, { recursive: true });
+}
+// skip: nobody reached the halfway mark (counter key never created → 404)
+{
+  const dir = tempRepo('2026-10-20');
+  const p = mockProvider('mock');
+  const r = await main(opts({ root: dir, providers: [p], fetchFn: counter(null) }));
+  assert.equal(r.status, 'skipped');
+  assert.match(r.reason, /nobody/);
+  assert.equal(p.calls, 0, 'no LLM calls when nobody played');
+  assert.equal(readFileSync(path.join(dir, 'index.html'), 'utf8').includes("const SET_ID = '2026-10-20';"), true);
+  rmSync(dir, { recursive: true });
+}
+// counter unreachable → transient error (retried by a later slot)
+{
+  const dir = tempRepo('2026-10-20');
+  await assert.rejects(main(opts({ root: dir, providers: [mockProvider('mock')], fetchFn: counter('down') })), e => e.transient === true);
+  rmSync(dir, { recursive: true });
+}
+console.log('main() skip paths: OK');
 
-// Extract the <script> body and check it's syntactically valid JS.
-// `new Function(body)` only compiles/parses — it does not execute the body,
-// so this is a pure syntax check with no DOM required.
-const scriptMatch = updated.match(/<script>([\s\S]*?)<\/script>/);
-assert.ok(scriptMatch, 'script tag should exist');
-new Function(scriptMatch[1]);
-console.log('splice + resulting <script> body: parses without SyntaxError');
+// refresh: first provider overloaded (503), second has a bad key (403), third works
+{
+  const dir = tempRepo('2026-10-20');
+  const overloaded = mockProvider('overloaded', { failWith: new GenerationError('HTTP 503', true) });
+  const badKey = mockProvider('bad-key', { failWith: new GenerationError('HTTP 403', false) });
+  const ok = mockProvider('ok');
+  const r = await main(opts({ root: dir, providers: [overloaded, badKey, ok], fetchFn: counter(2) }));
+  assert.equal(r.status, 'refreshed', r.reason);
+  assert.equal(badKey.calls, 1, 'a permanently failing provider is tried once, then skipped');
+
+  const html = readFileSync(path.join(dir, 'index.html'), 'utf8');
+  assert.equal(readSetId(html), '2026-10-22');
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  new Function(script); // syntax check only
+  const bank = new Function(script.slice(0, script.indexOf('/* ---------- helpers')) + 'return BANK;')();
+  assert.equal(bank.length, 100);
+  assert.deepEqual([0, 1, 2].map(d => bank.filter(q => q.d === d).length), [30, 40, 30]);
+  assert.equal(new Set(bank.map(q => q.q)).size, 100);
+  assert.ok(!bank.some(q => q.q === 'English junk'));
+  assert.ok(!realHtml.includes('परीक्षाप्रश्नः') && html.includes('परीक्षाप्रश्नः'));
+
+  const archive = readdirSync(path.join(dir, 'data', 'questions-archive'));
+  assert.equal(archive.length, 30, 'archive pruned to newest 30');
+  assert.ok(archive.includes('2026-10-22.json') && !archive.includes('2026-08-01.json'));
+  const last = JSON.parse(readFileSync(path.join(dir, 'data', 'last-run.json'), 'utf8'));
+  assert.equal(last.previousSet, '2026-10-20');
+  assert.equal(last.plays, 2);
+  rmSync(dir, { recursive: true });
+}
+console.log('main() refresh with provider fallback + review: OK');
+
+// every provider has a bad key → permanent (non-transient) error, index.html untouched
+{
+  const dir = tempRepo('2026-10-20');
+  const before = readFileSync(path.join(dir, 'index.html'), 'utf8');
+  await assert.rejects(
+    main(opts({ root: dir, providers: [mockProvider('x', { failWith: new GenerationError('HTTP 400', false) })], fetchFn: counter(1) })),
+    e => e.transient === false
+  );
+  assert.equal(readFileSync(path.join(dir, 'index.html'), 'utf8'), before);
+  rmSync(dir, { recursive: true });
+}
+// force refresh ignores the counter
+{
+  const dir = tempRepo('2026-10-22');
+  const r = await main(opts({ root: dir, env: { FORCE_REFRESH: 'true' }, providers: [mockProvider('ok')], fetchFn: counter('down') }));
+  assert.equal(r.status, 'refreshed');
+  rmSync(dir, { recursive: true });
+}
+console.log('main() failure + force paths: OK');
 
 console.log('\nALL DRY-RUN CHECKS PASSED');

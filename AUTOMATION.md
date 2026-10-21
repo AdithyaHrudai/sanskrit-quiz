@@ -1,68 +1,109 @@
-# Daily question refresh — setup
+# Question refresh — how it works
 
-Every day at 02:30 UTC (08:00 IST), a GitHub Actions workflow
-(`.github/workflows/daily-questions.yml`) runs `scripts/generate-questions.mjs`,
-which:
+The quiz gets a fresh set of 100 questions **at most once a day, and only if
+someone actually played the current set** — at least one visitor answered at
+least half (50) of its questions. If nobody plays, the set stays as it is and
+nothing runs against the LLM API or the repo.
 
-1. Calls a free LLM API (Groq or Gemini — whichever key you've configured) to
-   generate 100 new Sanskrit MCQs (30 easy / 40 medium / 30 hard) across the
-   quiz's topics.
-2. Validates the response strictly: exact question count, exact difficulty
-   split, Devanagari-only text, exactly 4 options per question, no duplicates,
-   only allowed topic keys.
-3. If valid, rewrites the `T` and `BANK` blocks in `index.html` (between the
-   `AUTO-GENERATED` marker comments) and commits + pushes.
-4. If invalid after 4 retries, it leaves `index.html` untouched and the
-   workflow run shows as failed — **the live quiz is never overwritten with
-   broken content.**
+## The pieces
 
-This costs nothing: GitHub Actions is free for public repos, and both Groq
-and Gemini offer a free API tier that comfortably covers one generation call
-per day.
+1. **The page** (`index.html`) remembers which questions this device has
+   answered for the current set (`SET_ID`), in `localStorage`, so a reload
+   doesn't lose progress — and unanswered questions are served first on a
+   replay. When the count reaches half the set, it pings a free public
+   counter once:
+   `https://abacus.jasoncameron.dev/hit/adithyahrudai-sanskrit-quiz/set-<SET_ID>`
+   ([Abacus](https://jasoncameron.dev/abacus/) — no account or key needed).
+   The start and end screens show the progress towards that mark.
 
-## One-time setup
+2. **The workflow** (`.github/workflows/daily-questions.yml`) runs at 08:00,
+   12:00 and 16:00 IST. Each run calls `scripts/generate-questions.mjs`, which:
+   - skips if the current set is already today's (IST);
+   - reads the counter for the current set and skips if it's 0;
+   - otherwise generates a new set in six small batches (easy / medium / hard ×
+     two topic groups, 10 questions per topic), so each API call is quick;
+   - drops individual invalid questions (wrong topic, non-Devanagari or Latin
+     text, not 4 distinct options, duplicates of the last 30 sets) and asks
+     for replacements, rather than throwing away the whole set;
+   - sends every batch to a second, temperature-0 "strict reviewer" call that
+     flags wrong or ambiguous questions, which are also replaced;
+   - only rewrites `index.html` once all 100 are in hand, then commits.
 
-You need exactly one of these two secrets set on the repo. Only one is
-required — the script prefers Groq if both are present.
+   The 12:00 and 16:00 runs are retries: once the morning run has refreshed,
+   they see "already today's set" and exit in seconds.
 
-### Option A — Groq (recommended, fast, generous free tier)
+3. **Providers**: Gemini (`gemini-2.5-flash`), falling back to
+   `gemini-2.5-flash-lite` (separate free quota) when the first is overloaded,
+   then Groq if a `GROQ_API_KEY` is set. 429/5xx/timeouts are retried with
+   backoff; a bad key or unknown model is skipped immediately.
 
-1. Get a free key at https://console.groq.com/keys
-2. Add it as a repo secret:
-   ```
-   gh secret set GROQ_API_KEY --repo AdithyaHrudai/sanskrit-quiz
-   ```
-   (paste the key when prompted), or via GitHub web UI:
-   Settings → Secrets and variables → Actions → New repository secret →
-   name `GROQ_API_KEY`.
+## When will I get a failure email?
 
-### Option B — Gemini
+Only when something is actually broken:
 
-1. Get a free key at https://aistudio.google.com/apikey
-2. Add it as a repo secret named `GEMINI_API_KEY` the same way as above.
+- **Transient problems** (API overloaded, timeouts, counter unreachable) on the
+  08:00 or 12:00 run only log a warning — the next run retries. If the 16:00
+  run still can't refresh, that run fails and you get an email. The set is
+  still pending, so the next day's 08:00 run tries again.
+- **Permanent problems** (no/invalid API key, `index.html` markers missing)
+  fail on any run.
+- Manual runs always report failures.
 
-## Test it manually
+If a run fails, the live quiz keeps serving the last good set.
 
-Don't wait for the cron — trigger it on demand from the Actions tab
-("Daily question refresh" → Run workflow), or via CLI:
+## Inactivity keepalive
+
+GitHub disables scheduled workflows in public repos after 60 days without
+repository activity, which would now happen whenever nobody plays for two
+months. Each scheduled run calls the "enable workflow" API on itself to reset
+that timer, so no keepalive commits are needed.
+
+## Secrets
+
+Only `GEMINI_API_KEY` is required (already set). Optional:
+
+| Secret | Purpose |
+| --- | --- |
+| `GEMINI_MODEL` | Override the primary Gemini model (default `gemini-2.5-flash`) |
+| `GEMINI_FALLBACK_MODEL` | Override the fallback model (default `gemini-2.5-flash-lite`) |
+| `GROQ_API_KEY` | Adds Groq as a last-resort provider ([free key](https://console.groq.com/keys)) |
+| `GROQ_MODEL` | Override the Groq model (default `llama-3.3-70b-versatile`) |
 
 ```
-gh workflow run daily-questions.yml --repo AdithyaHrudai/sanskrit-quiz
+gh secret set GROQ_API_KEY --repo AdithyaHrudai/sanskrit-quiz
+```
+
+Note: as of mid-2026, `gemini-2.0-flash`/`gemini-2.0-flash-lite` have no
+free-tier quota on new keys (`limit: 0`) — stick to `gemini-2.5-*` or newer.
+
+## Manual runs and checks
+
+Force a refresh regardless of activity (Actions tab → "Daily question
+refresh" → Run workflow → tick *force*), or:
+
+```
+gh workflow run daily-questions.yml --repo AdithyaHrudai/sanskrit-quiz -f force=true
 gh run watch --repo AdithyaHrudai/sanskrit-quiz
 ```
 
-Check `data/last-run.json` after a run for a quick status summary (date,
-provider, pass/fail, topic distribution). Each day's raw generated question
-set is also archived to `data/questions-archive/YYYY-MM-DD.json` for audit
-(auto-pruned after 30 days).
+Each run's outcome (skipped / refreshed / failed, and why) is shown on its
+summary page. See how many visitors got past halfway on a set:
 
-## Changing the model or schedule
+```
+curl https://abacus.jasoncameron.dev/get/adithyahrudai-sanskrit-quiz/set-2026-10-20
+```
 
-- Model: set `GROQ_MODEL` or `GEMINI_MODEL` as an extra repo secret/variable
-  to override the defaults (`llama-3.3-70b-versatile` / `gemini-2.5-flash`).
-  Note: as of mid-2026, `gemini-2.0-flash`/`gemini-2.0-flash-lite` have no free-tier
-  quota left on new keys (`limit: 0`) — stick to `gemini-2.5-*` models.
-- Schedule: edit the `cron` line in `.github/workflows/daily-questions.yml`.
-- Topics: edit `ALLOWED_TOPICS` in `scripts/generate-questions.mjs` — the
-  start-screen topic chips are regenerated automatically to match whatever
-  topics actually appear in that day's 100 questions.
+(404 means nobody yet.) `data/last-run.json` records the latest refresh, and
+each set is archived to `data/questions-archive/YYYY-MM-DD.json` (newest 30
+kept; also used to avoid repeating questions).
+
+Offline tests: `node scripts/test-dryrun.mjs`.
+
+## Tuning
+
+- Threshold: `NEED` in `index.html` (half the set).
+- Schedule: the `cron` lines in the workflow — keep `FINAL_ATTEMPT` pointing
+  at the last slot.
+- Topics / batch sizes: `ALLOWED_TOPICS` and `BATCHES` in
+  `scripts/generate-questions.mjs`. The start-screen topic chips follow
+  whatever topics the set actually contains.

@@ -307,6 +307,11 @@
     letter-spacing: .3em;
     user-select: none;
   }
+  .panel .note {
+    font-size: .88rem;
+    margin-top: 16px;
+  }
+  .panel .note.done { color: var(--good); font-weight: 700; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -331,6 +336,7 @@
     <p><span id="qcount"></span> प्रश्नाः — मिश्रितक्रमेण ।<br>
     सम्यक् उत्तरं <b style="color:var(--good)">हरितम्</b>, अशुद्धं <b style="color:var(--bad)">रक्तम्</b> भविष्यति ।</p>
     <div class="topics" id="topiclist"></div>
+    <p class="note" id="note-start"></p>
     <button class="btn" id="startbtn">आरभताम् →</button>
   </section>
 
@@ -350,6 +356,7 @@
     <h2>क्रीडा समाप्ता&nbsp;!</h2>
     <div class="bigscore" id="final"></div>
     <p id="msg"></p>
+    <p class="note" id="note-end"></p>
     <button class="btn" id="again">पुनः क्रीडतु ↻</button>
   </section>
 
@@ -364,6 +371,10 @@
    a[0] is always the correct answer; options are shuffled at render.
    Sources: Paninian grammar, Amarakosha, Puranas, Upanishads,
    Ramayana, Mahabharata, subhashita collections, world geography. */
+/* AUTO-GENERATED:SET:START — overwritten by scripts/generate-questions.mjs, do not hand-edit */
+const SET_ID = '2026-10-20';
+/* AUTO-GENERATED:SET:END */
+
 /* AUTO-GENERATED:TOPICS:START — overwritten daily by scripts/generate-questions.mjs, do not hand-edit */
 const T = {
   vy: 'व्याकरणम्',
@@ -505,12 +516,67 @@ function shuffle(arr) {
   return a;
 }
 
+/* ---------- refresh signal ----------
+   The question set is only regenerated (scripts/generate-questions.mjs) if
+   someone answered at least half of the current set. Answered questions are
+   remembered per set on this device, so a reload doesn't lose progress; once
+   the threshold is crossed we ping a public counter the workflow reads. */
+const COUNTER_NS = 'adithyahrudai-sanskrit-quiz';
+const COUNTER_URL = 'https://abacus.jasoncameron.dev/hit/' + COUNTER_NS + '/set-' + SET_ID;
+const NEED = Math.ceil(BANK.length / 2);
+const ANS_KEY = 'sq:' + SET_ID + ':answered';
+const SENT_KEY = 'sq:' + SET_ID + ':sent';
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+// drop progress kept for earlier sets
+try {
+  Object.keys(localStorage)
+    .filter(k => k.startsWith('sq:') && !k.startsWith('sq:' + SET_ID + ':'))
+    .forEach(k => localStorage.removeItem(k));
+} catch (e) {}
+
+let answered;
+try { answered = new Set(JSON.parse(store.get(ANS_KEY)) || []); } catch (e) { answered = new Set(); }
+let sent = store.get(SENT_KEY) === '1', sending = false;
+
+function markAnswered(q) {
+  const i = BANK.indexOf(q);
+  if (i < 0 || answered.has(i)) return;
+  answered.add(i);
+  store.set(ANS_KEY, JSON.stringify([...answered]));
+  report();
+}
+
+function report() {
+  if (sent || sending || answered.size < NEED) return;
+  sending = true;
+  fetch(COUNTER_URL, { cache: 'no-store', keepalive: true })
+    .then(r => { if (r.ok) { sent = true; store.set(SENT_KEY, '1'); } })
+    .catch(() => {})
+    .finally(() => { sending = false; });
+}
+
+function showNote(el) {
+  const done = answered.size >= NEED;
+  el.className = 'note' + (done ? ' done' : '');
+  el.textContent = done
+    ? 'लक्ष्यं साधितम् ! श्वः नूतनाः प्रश्नाः आगमिष्यन्ति ।'
+    : 'प्रश्नानाम् अर्धे उत्तरिते श्वः नूतनाः प्रश्नाः आगमिष्यन्ति — उत्तरिताः ' + dv(answered.size) + ' / ' + dv(NEED);
+}
+
 /* ---------- state ---------- */
 let order = [], idx = 0, score = 0, locked = false, timer = null;
 
 function buildOrder() {
-  // fully jumbled — all topics and difficulties randomly mixed
-  order = shuffle(BANK.slice());
+  // fully jumbled — all topics and difficulties randomly mixed, but questions
+  // not yet answered on this device come first so replays move towards NEED
+  const fresh = BANK.filter((q, i) => !answered.has(i));
+  const seen = BANK.filter((q, i) => answered.has(i));
+  order = shuffle(fresh).concat(shuffle(seen));
 }
 
 /* ---------- screens ---------- */
@@ -525,6 +591,7 @@ function showStart() {
   });
   const countText = $('qcount');
   if (countText) countText.textContent = dv(BANK.length);
+  showNote($('note-start'));
 }
 
 function startGame() {
@@ -576,6 +643,7 @@ function pick(btn, ok) {
 
   const buttons = [...$('opts').children];
   buttons.forEach(b => { b.disabled = true; });
+  markAnswered(order[idx]);
 
   if (ok) {
     btn.classList.add('correct');
@@ -618,6 +686,7 @@ function finish() {
   else if (pct >= 0.5) msg = 'साधु ! अर्धाधिकं साधितम् — पुनः क्रीडित्वा अधिकं जानातु ।';
   else                 msg = 'शुभारम्भः ! अभ्यासेन एव विद्या वर्धते — पुनः प्रयतताम् ।';
   $('msg').textContent = msg;
+  showNote($('note-end'));
 }
 
 /* ---------- wire up ---------- */
@@ -634,6 +703,7 @@ document.addEventListener('keydown', e => {
 });
 
 showStart();
+report(); // retry a ping that failed last time (e.g. while offline)
 </script>
 
 </body>
