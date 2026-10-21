@@ -28,7 +28,7 @@ jobs:
           FINAL_ATTEMPT: 'true'
         run: node scripts/generate-questions.mjs
       - name: Report
-        run: echo "generator outcome: ${{ steps.gen.outcome }}"
+        run: echo "generator outcome=${{ steps.gen.outcome }}"
       - name: Commit and push if changed
         run: |
           git config user.name "sanskrit-quiz-bot"
