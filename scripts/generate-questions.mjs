@@ -64,8 +64,16 @@ export const TOTAL = BATCHES.reduce((s, b) => s + b.n, 0);
 
 const ROUNDS_PER_BATCH = 6;        // top-up calls per batch before giving up
 const EXTRA_PER_CALL = 3;          // ask for a few spare questions to absorb drops
-const TRIES_PER_PROVIDER = 3;      // per call, on transient errors, before falling back
+const TRIES_PER_PROVIDER = 3;      // per call, on 5xx/timeouts, before falling back
 const BACKOFF_MS = [20_000, 60_000];
+// Free-tier quotas are per minute per model, and a refresh makes ~15 calls
+// (generate + review per batch), so calls to one model are spaced out and a
+// rate-limited call waits as long as the API asks instead of falling back to
+// the weaker model (seen live: bursts of 429s, and flash-lite's hard questions
+// mostly rejected by the reviewer).
+const MIN_GAP_MS = 13_000;         // ≤ ~4.6 requests/minute per model
+const RATE_LIMIT_WAITS = 6;        // per call, on per-minute 429s
+const MAX_RATE_WAIT_MS = 90_000;
 const CALL_TIMEOUT_MS = 180_000;
 const BUDGET_MS = 30 * 60_000;     // stays well inside the workflow's 45-minute job timeout
 const ARCHIVE_KEEP = 30;
@@ -130,6 +138,31 @@ export async function readPlayCount(setId, fetchFn = fetch, retryDelayMs = 5_000
 
 /* ---------- LLM providers ---------- */
 
+// Reads which quota was hit and how long to wait from a 429 body (Gemini puts
+// QuotaFailure + RetryInfo in error.details) or a Retry-After header (Groq).
+export function rateLimitError(body, retryAfterHeader) {
+  let details = [];
+  let message = '';
+  try {
+    const err = JSON.parse(body).error ?? {};
+    details = Array.isArray(err.details) ? err.details : [];
+    message = String(err.message ?? '');
+  } catch {
+    message = body;
+  }
+  const quotaIds = details.flatMap(d => (d.violations ?? []).map(v => v.quotaId)).filter(Boolean);
+  const retryDelay = details.find(d => d.retryDelay)?.retryDelay ?? message.match(/retry in ([\d.]+)s/i)?.[1];
+  const seconds = parseFloat(retryDelay ?? retryAfterHeader);
+  const e = new GenerationError(
+    `HTTP 429 (${quotaIds.join(', ') || 'rate limited'}${Number.isFinite(seconds) ? `, retry in ${Math.ceil(seconds)}s` : ''})`,
+    true
+  );
+  e.rateLimited = true;
+  e.daily = quotaIds.some(id => /PerDay/i.test(id));
+  e.retryAfterMs = Number.isFinite(seconds) ? Math.ceil(seconds * 1000) : null;
+  return e;
+}
+
 async function postJson(url, headers, body) {
   let res;
   try {
@@ -143,10 +176,10 @@ async function postJson(url, headers, body) {
     throw new GenerationError(`request failed: ${e.name === 'TimeoutError' ? `timed out after ${CALL_TIMEOUT_MS / 1000}s` : e.message}`, true);
   }
   const text = await res.text();
+  if (res.status === 429) throw rateLimitError(text, res.headers.get('retry-after'));
   if (!res.ok) {
-    // 429 / 5xx are worth retrying; anything else (bad key, unknown model) won't fix itself.
-    const transient = res.status === 429 || res.status >= 500;
-    throw new GenerationError(`HTTP ${res.status}: ${text.slice(0, 300)}`, transient);
+    // 5xx is worth retrying; anything else (bad key, unknown model) won't fix itself.
+    throw new GenerationError(`HTTP ${res.status}: ${text.slice(0, 300)}`, res.status >= 500);
   }
   try {
     return JSON.parse(text);
@@ -210,27 +243,39 @@ export function buildProviders(env) {
   return providers;
 }
 
-async function generateText(prompt, { providers, log, backoffMs, deadline }, temperature = 0.9) {
+// p.out marks a provider unusable for the rest of the run: 'permanent' (bad
+// key, unknown model) or 'quota' (daily quota spent — fine again tomorrow).
+async function generateText(prompt, { providers, log, backoffMs, deadline, minGapMs = MIN_GAP_MS }, temperature = 0.9) {
   let lastErr = null;
+  const checkBudget = () => {
+    if (Date.now() > deadline) throw new GenerationError('time budget exhausted', true);
+  };
   for (const p of providers) {
-    if (p.dead) continue;
-    for (let i = 0; i < TRIES_PER_PROVIDER; i++) {
-      if (Date.now() > deadline) throw new GenerationError('time budget exhausted', true);
+    let failures = 0, waits = 0;
+    while (!p.out && failures < TRIES_PER_PROVIDER) {
+      checkBudget();
+      const gap = (p.lastCall ?? 0) + minGapMs - Date.now();
+      if (gap > 0) await sleep(gap);
+      checkBudget();
+      p.lastCall = Date.now();
       try {
         return { text: await p.call(prompt, { temperature }), provider: p.name };
       } catch (e) {
         lastErr = e;
         log(`  [${p.name}] ${e.message}`);
-        if (e.transient === false) {
-          p.dead = true;
-          break;
+        if (e.transient === false) p.out = 'permanent';
+        else if (e.rateLimited && e.daily) p.out = 'quota';
+        else if (e.rateLimited && waits < RATE_LIMIT_WAITS) {
+          waits++;
+          await sleep(Math.min(e.retryAfterMs ?? backoffMs[0], MAX_RATE_WAIT_MS));
+        } else if (++failures < TRIES_PER_PROVIDER) {
+          await sleep(backoffMs[Math.min(failures - 1, backoffMs.length - 1)]);
         }
-        if (i < TRIES_PER_PROVIDER - 1) await sleep(backoffMs[Math.min(i, backoffMs.length - 1)]);
       }
     }
   }
-  const anyAlive = providers.some(p => !p.dead);
-  throw new GenerationError(`all providers failed (last error: ${lastErr?.message ?? 'none configured'})`, anyAlive);
+  const allPermanent = providers.every(p => p.out === 'permanent');
+  throw new GenerationError(`all providers failed (last error: ${lastErr?.message ?? 'none configured'})`, !allPermanent);
 }
 
 /* ---------- prompting & validation ---------- */
@@ -450,6 +495,7 @@ export async function main({
   backoffMs = BACKOFF_MS,
   counterRetryMs = 5_000,
   budgetMs = BUDGET_MS,
+  minGapMs = MIN_GAP_MS,
 } = {}) {
   const indexHtml = path.join(root, 'index.html');
   const archiveDir = path.join(root, 'data', 'questions-archive');
@@ -476,7 +522,7 @@ export async function main({
   const recent = readArchive(archiveDir).slice(-RECENT_SETS).flatMap(s => s.questions);
   const seen = new Set(recent.map(q => normalize(q.q)));
 
-  const ctx = { providers, seen, recent, log, backoffMs, deadline: Date.now() + budgetMs };
+  const ctx = { providers, seen, recent, log, backoffMs, minGapMs, deadline: Date.now() + budgetMs };
   const questions = [];
   const usedProviders = new Set();
   for (const [i, batch] of BATCHES.entries()) {

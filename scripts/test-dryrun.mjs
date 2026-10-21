@@ -6,7 +6,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import {
   BATCHES, TOTAL, COUNTER_NS, GenerationError, istDate, readSetId, stripFences,
-  checkQuestion, parseBatch, buildPrompt, buildReviewPrompt, main,
+  checkQuestion, parseBatch, buildPrompt, buildReviewPrompt, rateLimitError, main,
 } from './generate-questions.mjs';
 
 const ROOT = new URL('..', import.meta.url);
@@ -101,7 +101,30 @@ const counter = value => async url => {
 
 const NOW = new Date('2026-10-22T03:00:00Z'); // 08:30 IST on 2026-10-22
 const quiet = () => {};
-const opts = extra => ({ env: {}, now: NOW, log: quiet, backoffMs: [0], counterRetryMs: 0, ...extra });
+const opts = extra => ({ env: {}, now: NOW, log: quiet, backoffMs: [0], counterRetryMs: 0, minGapMs: 0, ...extra });
+
+// --- 429 parsing (shape of a real Gemini free-tier response) ---
+{
+  const body = JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota ... Please retry in 37.5s.', details: [
+    { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }] },
+    { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '37s' },
+  ] } });
+  const e = rateLimitError(body, null);
+  assert.equal(e.rateLimited, true);
+  assert.equal(e.daily, false);
+  assert.equal(e.retryAfterMs, 37_000);
+  assert.match(e.message, /PerMinute.*retry in 37s/);
+  const daily = rateLimitError(body.replace('PerMinute', 'PerDay'), null);
+  assert.equal(daily.daily, true);
+  assert.equal(rateLimitError('not json', '12').retryAfterMs, 12_000, 'falls back to Retry-After header');
+}
+console.log('rateLimitError(): OK');
+
+function limited({ daily = false } = {}) {
+  const e = new GenerationError('HTTP 429', true);
+  Object.assign(e, { rateLimited: true, daily, retryAfterMs: 0 });
+  return e;
+}
 
 // skip: set is already today's
 {
@@ -176,6 +199,30 @@ console.log('main() refresh with provider fallback + review: OK');
     e => e.transient === false
   );
   assert.equal(readFileSync(path.join(dir, 'index.html'), 'utf8'), before);
+  rmSync(dir, { recursive: true });
+}
+// per-minute 429s: wait and retry the same model rather than falling back
+{
+  const dir = tempRepo('2026-10-20');
+  const primary = mockProvider('primary');
+  const inner = primary.call;
+  let n = 0;
+  primary.call = async function (prompt) {
+    if (n++ % 3 === 0) { this.calls++; throw limited(); } // every third call rate-limited
+    return inner.call(this, prompt);
+  };
+  const fallback = mockProvider('fallback');
+  const r = await main(opts({ root: dir, providers: [primary, fallback], fetchFn: counter(1) }));
+  assert.equal(r.status, 'refreshed');
+  assert.equal(fallback.calls, 0, 'per-minute rate limits never push work to the fallback model');
+  rmSync(dir, { recursive: true });
+}
+// daily quota spent on every model → transient (a later slot / tomorrow retries)
+{
+  const dir = tempRepo('2026-10-20');
+  const p = mockProvider('x', { failWith: limited({ daily: true }) });
+  await assert.rejects(main(opts({ root: dir, providers: [p], fetchFn: counter(1) })), e => e.transient === true);
+  assert.equal(p.calls, 1, 'a model out of daily quota is not retried');
   rmSync(dir, { recursive: true });
 }
 // force refresh ignores the counter
