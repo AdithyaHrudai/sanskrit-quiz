@@ -1,9 +1,9 @@
 {
-  "date": "2026-10-21",
-  "previousSet": "2026-10-20",
+  "date": "2026-10-22",
+  "previousSet": "2026-10-21",
   "plays": 1,
   "provider": "gemini:gemini-3-flash-preview",
-  "apiCalls": 6,
+  "apiCalls": 4,
   "reviewed": true,
   "status": "OK",
   "total": 100,
